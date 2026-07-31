@@ -2710,7 +2710,7 @@
       targetOddsLookup = fetchBsportsfanOddsMarket(currentSnapshot.url, {
         matchDateTs: currentSnapshot.matchDateTs,
         deadlineAt: Number(options.deadlineAt || 0),
-        requestPriority: "background",
+        requestPriority: options.requestPriority || "background",
         allowIframe: true
       }).then(
         (market) => ({ market, error: null }),

@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Прогноз настольного тенниса",
   "description": "Прогнозирует 2+ сета: единый умеренный режим с восстановлением стартовых коэффициентов.",
-  "version": "0.30.29",
+  "version": "0.30.30",
   "action": {
     "default_title": "Прогноз настольного тенниса",
     "default_popup": "src/popup/popup.html"

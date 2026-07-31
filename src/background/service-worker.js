@@ -2476,28 +2476,127 @@ async function updateTelegramPredictionMessageOpeningOdds(matchUrlValue, market)
         }
       }
     }
+    const sideIndex = sanitizeCalibrationSideIndex(ref.sideIndex);
+    refs[key] = {
+      ...ref,
+      text: refEdited > 0 ? nextText : ref.text,
+      leftOdds,
+      rightOdds,
+      playerOdds: sideIndex === 0 ? leftOdds : sideIndex === 1 ? rightOdds : null,
+      opponentOdds: sideIndex === 0 ? rightOdds : sideIndex === 1 ? leftOdds : null,
+      referenceMoneylineMarket,
+      referenceOddsMeaning: "display-only-match-winner",
+      openingOddsEditPending: refEdited === 0,
+      editedAt: refEdited > 0 ? Date.now() : Number(ref.editedAt || 0)
+    };
     if (refEdited > 0) {
-      const sideIndex = sanitizeCalibrationSideIndex(ref.sideIndex);
-      refs[key] = {
-        ...ref,
-        text: nextText,
-        leftOdds,
-        rightOdds,
-        playerOdds: sideIndex === 0 ? leftOdds : sideIndex === 1 ? rightOdds : null,
-        opponentOdds: sideIndex === 0 ? rightOdds : sideIndex === 1 ? leftOdds : null,
-        referenceMoneylineMarket,
-        referenceOddsMeaning: "display-only-match-winner",
-        editedAt: Date.now()
-      };
       edited += refEdited;
     }
   }
-  if (edited > 0) {
+  if (matching.length > 0) {
     await chrome.storage.local.set({
       [TELEGRAM_MESSAGE_REFS_KEY]: pruneTelegramPredictionMessageRefs(refs)
     });
   }
-  return { edited: edited > 0, messages: edited };
+  return {
+    edited: edited > 0,
+    messages: edited,
+    referencesUpdated: matching.length
+  };
+}
+
+function hydrateTelegramPredictionRefOpeningOdds(ref, datasetRecord) {
+  const source = ref && typeof ref === "object" ? ref : {};
+  if (getTelegramReferenceMoneylineMarket(source)) {
+    return source;
+  }
+  const record = datasetRecord && typeof datasetRecord === "object" ? datasetRecord : {};
+  const prematch = record.prematch || record.prematchSnapshot || {};
+  const market = [
+    record.historicalOpeningMoneyline,
+    prematch.referenceMoneylineMarket,
+    prematch.moneylineMarket
+  ].find((candidate) => (
+    candidate
+    && finiteAuditNumber(candidate.leftOdds) > 1
+    && finiteAuditNumber(candidate.rightOdds) > 1
+    && normalizeTelegramText(
+      candidate.quoteSource || candidate.preferredSource || ""
+    ).toLowerCase() === "opening"
+  ));
+  if (!market) {
+    return source;
+  }
+
+  const refPlayers = Array.isArray(source.players)
+    ? source.players.slice(0, 2).map(normalizeTelegramText).filter(Boolean)
+    : [];
+  const recordPlayers = Array.isArray(record.players) && record.players.length >= 2
+    ? record.players.slice(0, 2).map(normalizeTelegramText).filter(Boolean)
+    : Array.isArray(prematch.players)
+      ? prematch.players.slice(0, 2).map(normalizeTelegramText).filter(Boolean)
+      : [];
+  let reversed = false;
+  if (refPlayers.length >= 2 && recordPlayers.length >= 2) {
+    const sameOrder = areTelegramNamesSame(refPlayers[0], recordPlayers[0])
+      && areTelegramNamesSame(refPlayers[1], recordPlayers[1]);
+    const reverseOrder = areTelegramNamesSame(refPlayers[0], recordPlayers[1])
+      && areTelegramNamesSame(refPlayers[1], recordPlayers[0]);
+    if (!sameOrder && !reverseOrder) {
+      return source;
+    }
+    reversed = reverseOrder;
+  }
+
+  const marketLeftOdds = finiteAuditNumber(market.leftOdds);
+  const marketRightOdds = finiteAuditNumber(market.rightOdds);
+  const leftOdds = reversed ? marketRightOdds : marketLeftOdds;
+  const rightOdds = reversed ? marketLeftOdds : marketRightOdds;
+  const sideIndex = sanitizeCalibrationSideIndex(source.sideIndex);
+  return {
+    ...source,
+    leftOdds,
+    rightOdds,
+    playerOdds: sideIndex === 0 ? leftOdds : sideIndex === 1 ? rightOdds : source.playerOdds,
+    opponentOdds: sideIndex === 0 ? rightOdds : sideIndex === 1 ? leftOdds : source.opponentOdds,
+    referenceMoneylineMarket: {
+      status: "ready",
+      marketType: "matchResult",
+      quoteSource: "opening",
+      leftOdds,
+      rightOdds,
+      usage: "display-only",
+      modelInput: false
+    },
+    referenceOddsMeaning: "display-only-match-winner"
+  };
+}
+
+function restoreTelegramPredictionOpeningOddsInText(text, ref) {
+  const players = Array.isArray(ref && ref.players)
+    ? ref.players.slice(0, 2).map(normalizeTelegramText).filter(Boolean)
+    : [];
+  if (players.length < 2) {
+    return normalizeTelegramMessageText(text || "");
+  }
+  const hasOdds = Boolean(getTelegramReferenceMoneylineMarket(ref))
+    || finiteAuditNumber(ref && ref.leftOdds) > 1
+    && finiteAuditNumber(ref && ref.rightOdds) > 1;
+  if (!hasOdds) {
+    return normalizeTelegramMessageText(text || "");
+  }
+  const matchLine = formatTelegramPredictionMatchLine(
+    { ...ref, players },
+    players,
+    normalizeTelegramText(ref && ref.playerName || "")
+  );
+  if (!matchLine) {
+    return normalizeTelegramMessageText(text || "");
+  }
+  return normalizeTelegramMessageText(text || "")
+    .split("\n")
+    .map((line) => /^🆚\s*/.test(normalizeTelegramText(line)) ? matchLine : line)
+    .join("\n");
 }
 
 async function updateTelegramPredictionDatasetResult(matchUrlValue, finalScoreValue, result = {}) {
@@ -6415,8 +6514,9 @@ async function updateTelegramPredictionResultNow(result) {
   const errors = [];
   const settings = await getTelegramSettings();
   for (const [key, ref] of matching) {
-    const resultInfo = buildTelegramPredictionResultInfo(ref, finalScore, result || {});
-    const existingResolved = isResolvedTelegramPredictionMessageRef(ref);
+    const hydratedRef = hydrateTelegramPredictionRefOpeningOdds(ref, datasetRecord);
+    const resultInfo = buildTelegramPredictionResultInfo(hydratedRef, finalScore, result || {});
+    const existingResolved = isResolvedTelegramPredictionMessageRef(hydratedRef);
     const incomingResolved = isResolvedTelegramPredictionResultInfo(resultInfo);
     if (existingResolved && !incomingResolved) {
       alreadyUpdated += 1;
@@ -6426,26 +6526,30 @@ async function updateTelegramPredictionResultNow(result) {
       existingResolved
       && incomingResolved
       && (
-        normalizeTelegramFinalScore(ref.finalScore || "") !== normalizeTelegramFinalScore(resultInfo.finalScore || "")
-        || normalizeTelegramText(ref.resultStatus || "") !== normalizeTelegramText(resultInfo.status || "")
+        normalizeTelegramFinalScore(hydratedRef.finalScore || "") !== normalizeTelegramFinalScore(resultInfo.finalScore || "")
+        || normalizeTelegramText(hydratedRef.resultStatus || "") !== normalizeTelegramText(resultInfo.status || "")
       )
     ) {
       alreadyUpdated += 1;
       continue;
     }
     const messageFinalScore = normalizeTelegramFinalScore(resultInfo.finalScore || finalScore);
-    const nextText = formatTelegramPredictionResultMessage(ref.text, messageFinalScore, resultInfo);
+    const currentText = restoreTelegramPredictionOpeningOddsInText(
+      hydratedRef.text,
+      hydratedRef
+    );
+    const nextText = formatTelegramPredictionResultMessage(currentText, messageFinalScore, resultInfo);
     const resultStatus = normalizeTelegramText(resultInfo.status || "");
     if (
-      normalizeTelegramFinalScore(ref.observedFinalScore || ref.finalScore) === finalScore
-      && normalizeTelegramText(ref.resultOrientation || "") === normalizeTelegramText(resultInfo.resultOrientation || "")
-      && normalizeTelegramText(ref.resultStatus || "") === resultStatus
-      && normalizeTelegramMessageText(ref.text) === normalizeTelegramMessageText(nextText)
+      normalizeTelegramFinalScore(hydratedRef.observedFinalScore || hydratedRef.finalScore) === finalScore
+      && normalizeTelegramText(hydratedRef.resultOrientation || "") === normalizeTelegramText(resultInfo.resultOrientation || "")
+      && normalizeTelegramText(hydratedRef.resultStatus || "") === resultStatus
+      && normalizeTelegramMessageText(hydratedRef.text) === normalizeTelegramMessageText(nextText)
     ) {
       alreadyUpdated += 1;
       continue;
     }
-    const messages = Array.isArray(ref.messages) ? ref.messages : [];
+    const messages = Array.isArray(hydratedRef.messages) ? hydratedRef.messages : [];
     let refEdited = 0;
     const refErrors = [];
     if (!settings.enabled || !settings.botToken) {
@@ -6476,7 +6580,7 @@ async function updateTelegramPredictionResultNow(result) {
     }
     refs[key] = refEdited > 0 || isAlreadyUpdated
       ? {
-        ...ref,
+        ...hydratedRef,
         text: nextText,
         finalScore: normalizeTelegramFinalScore(resultInfo.finalScore || ""),
         observedFinalScore: finalScore,
@@ -6487,7 +6591,7 @@ async function updateTelegramPredictionResultNow(result) {
         pendingResultEdit: null
       }
       : {
-        ...ref,
+        ...hydratedRef,
         editErrors: refErrors.slice(-5),
         pendingResultEdit: {
           text: nextText,
@@ -6495,7 +6599,12 @@ async function updateTelegramPredictionResultNow(result) {
           observedFinalScore: finalScore,
           resultOrientation: normalizeTelegramText(resultInfo.resultOrientation || ""),
           resultStatus,
-          attempts: Number(ref && ref.pendingResultEdit && ref.pendingResultEdit.attempts || 0),
+          attempts: Number(
+            hydratedRef
+            && hydratedRef.pendingResultEdit
+            && hydratedRef.pendingResultEdit.attempts
+            || 0
+          ),
           retryAt: Date.now() + TELEGRAM_RESULT_EDIT_RETRY_BASE_MS,
           updatedAt: Date.now()
         }
