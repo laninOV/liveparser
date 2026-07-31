@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "Прогноз настольного тенниса",
+  "description": "Прогнозирует 2+ сета: единый умеренный режим с восстановлением стартовых коэффициентов.",
+  "version": "0.30.28",
+  "action": {
+    "default_title": "Прогноз настольного тенниса",
+    "default_popup": "src/popup/popup.html"
+  },
+  "background": {
+    "service_worker": "src/background/service-worker.js"
+  },
+  "permissions": [
+    "scripting",
+    "storage",
+    "unlimitedStorage"
+  ],
+  "host_permissions": [
+    "https://*.bsportsfan.com/*",
+    "https://api.telegram.org/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.bsportsfan.com/*"
+      ],
+      "js": [
+        "src/shared/pipeline-policy.js",
+        "src/shared/start-match-rule.js",
+        "src/shared/verified-pair-regime-v1.js",
+        "src/content/bsportsfan-parser.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "src/content/bsportsfan-page-bridge.js"
+      ],
+      "matches": [
+        "https://*.bsportsfan.com/*"
+      ]
+    }
+  ]
+}

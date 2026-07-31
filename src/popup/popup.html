@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Прогноз настольного тенниса</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main class="popup">
+    <header class="popup__header">
+      <h1>Прогноз НТ</h1>
+      <span id="sourceBadge" class="badge">ожидание</span>
+    </header>
+
+    <section class="status">
+      <div class="status__label">Статус</div>
+      <div id="statusText" class="status__value">Загружаю...</div>
+      <div id="statusMeta" class="status__meta"></div>
+    </section>
+
+    <section id="forecastPanel" class="forecast" hidden>
+      <div class="forecast__title">Прогноз</div>
+      <div id="forecastWinner" class="forecast__winner"></div>
+      <div id="forecastBars" class="forecast__bars"></div>
+      <div id="forecastMeta" class="forecast__meta"></div>
+      <div id="forecastFactors" class="forecast__factors"></div>
+    </section>
+
+    <section id="details" class="details" hidden></section>
+
+    <section class="archive">
+      <div class="archive__head">
+        <div>
+          <div class="archive__title">Архив и сервис</div>
+          <div id="archiveStatus" class="archive__meta">загружаю...</div>
+        </div>
+        <button id="archiveRefresh" class="button-secondary button-small" type="button">Обновить</button>
+      </div>
+      <div id="archiveStats" class="archive__grid"></div>
+      <div class="archive__actions">
+        <button id="archiveDownload" class="button-secondary" type="button">Скачать архив</button>
+        <button id="archiveBackfill" class="button-secondary" type="button">Дособрать итоги</button>
+        <button id="archiveOddsBackfill" class="button-secondary" type="button">Дособрать стартовые кэфы</button>
+        <button id="archiveOddsImport" class="button-secondary" type="button">Кэфы из файлов</button>
+        <input id="archiveOddsFiles" type="file" accept="application/json,.json" multiple hidden>
+        <button id="archiveStatsPin" class="button-secondary" type="button">Восстановить закреп</button>
+        <button id="extensionReload" class="button-secondary" type="button">Перезапуск</button>
+        <button id="archiveClear" class="button-secondary button-danger" type="button">Очистить архив</button>
+      </div>
+      <div id="archiveActionStatus" class="archive__meta"></div>
+    </section>
+
+    <section class="telegram">
+      <div class="telegram__head">
+        <div>
+          <div class="telegram__title">Telegram · прогнозы 2+ сета</div>
+          <div id="telegramStatus" class="telegram__meta">не настроен</div>
+        </div>
+        <label class="telegram__toggle">
+          <input id="telegramEnabled" type="checkbox">
+          <span>вкл</span>
+        </label>
+      </div>
+      <label class="telegram__field">
+        <span>Bot token</span>
+        <input id="telegramBotToken" type="password" autocomplete="off" placeholder="123:ABC">
+      </label>
+      <label class="telegram__field">
+        <span>Chat ID</span>
+        <input id="telegramChatId" type="text" autocomplete="off" placeholder="955845459, -100...">
+      </label>
+      <label class="telegram__check">
+        <input id="telegramAutoSend" type="checkbox">
+        <span>отправлять прогнозы 2+ сетов автоматически</span>
+      </label>
+      <div class="telegram__actions">
+        <button id="telegramSave" class="button-secondary" type="button">Сохранить</button>
+        <button id="telegramTest" class="button-secondary" type="button">Тест</button>
+      </div>
+    </section>
+
+    <div class="actions">
+      <button id="forecastButton" type="button">Прогноз</button>
+    </div>
+  </main>
+
+  <script src="../shared/start-match-rule.js"></script>
+  <script src="../shared/verified-pair-regime-v1.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
