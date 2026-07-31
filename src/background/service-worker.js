@@ -61,6 +61,17 @@ const TELEGRAM_START_PAIR_REGIME_PROTOCOL_ID = String(
 const TELEGRAM_START_PAIR_REGIME_PRODUCTION_GATE_ID = String(
   TELEGRAM_START_PAIR_REGIME_PROTOCOL.gateId || ""
 );
+const TELEGRAM_STATS_COMPATIBLE_START_RULE_IDS = new Set([
+  TELEGRAM_MATCH_START_RULE_ID,
+  "match-start-history-pbp-8-5-3-v2"
+]);
+const TELEGRAM_STATS_COMPATIBLE_PAIR_PROTOCOL_IDS = new Set([
+  TELEGRAM_START_PAIR_REGIME_PROTOCOL_ID,
+  "start-moderate-live-deficit4-v6-2026-07-31",
+  "start-dual-signal-v5-2026-07-30",
+  "start-collapse-salvage-v4-2026-07-28",
+  "start-collapse-salvage-v3-2026-07-28"
+]);
 const TELEGRAM_MATCH_START_DELIVERY_MAX_AGE_MS = 20000;
 const BSPORTSFAN_PROXY_FETCH_TIMEOUT_MS = 12 * 1000;
 const BSPORTSFAN_PROXY_FETCH_MAX_CHARS = 5 * 1024 * 1024;
@@ -5435,7 +5446,7 @@ function summarizeTelegramStatsRows(rows) {
     summary.pointSnapshots += pointTimeline.length;
 
     const prematch = row && (row.prematch || row.prematchSnapshot);
-    if (!prematch || getTelegramStatsPrematchRuleId(prematch) !== TELEGRAM_MATCH_START_RULE_ID) {
+    if (!isCompatibleProductionStartStatsPrematch(prematch, row)) {
       continue;
     }
     const prematchResultStatus = getTelegramStatsPrematchResultStatus(row, prematch);
@@ -5448,14 +5459,11 @@ function summarizeTelegramStatsRows(rows) {
         summary.pendingSentPrematchRows += 1;
       }
     }
-    if (!isCurrentProductionPairPublished(prematch)) {
-      continue;
-    }
     addTelegramStatsDecision(
       summary.sentProductionStart,
-      "forecast",
+      sent ? "forecast" : "skip",
       prematchResultStatus,
-      true
+      sent
     );
   }
 
@@ -5876,12 +5884,10 @@ function getTelegramStatsPrematchRuleId(prematch) {
   );
 }
 
-function isCurrentProductionPairPublished(prematch) {
-  if (
-    !prematch
-    || !(prematch.sent === true || prematch.sent === 1)
-    || getTelegramStatsPrematchRuleId(prematch) !== TELEGRAM_MATCH_START_RULE_ID
-  ) {
+function isCompatibleProductionStartStatsPrematch(prematch, row = null) {
+  if (!prematch || !TELEGRAM_STATS_COMPATIBLE_START_RULE_IDS.has(
+    getTelegramStatsPrematchRuleId(prematch)
+  )) {
     return false;
   }
   const features = {
@@ -5891,17 +5897,26 @@ function isCurrentProductionPairPublished(prematch) {
   };
   const action = readTelegramPrematchFeatureText(
     prematch.decisionAction,
-    prematch.action
+    prematch.action,
+    prematch.decisionLabel
   ).toLowerCase();
-  return action === "forecast"
-    && readTelegramPrematchFeatureText(features.startMatchPairRegimeProtocolId)
-      === TELEGRAM_START_PAIR_REGIME_PROTOCOL_ID
-    && readTelegramPrematchFeatureText(features.startMatchProductionGateId)
-      === TELEGRAM_START_PAIR_REGIME_PRODUCTION_GATE_ID
+  const protocolId = readTelegramPrematchFeatureText(
+    features.startMatchPairRegimeProtocolId
+  );
+  const leagueName = readTelegramPrematchFeatureText(
+    prematch.leagueName,
+    features.leagueName,
+    row && row.leagueName,
+    prematch.audit && prematch.audit.league && prematch.audit.league.name
+  );
+  const decisionAt = getTelegramPrematchDecisionAt(prematch, row);
+  return ["forecast", "sent", "pass", "skip", "ставим", "пропуск"].includes(action)
+    && TELEGRAM_STATS_COMPATIBLE_PAIR_PROTOCOL_IDS.has(protocolId)
     && readTelegramPrematchFeatureText(features.startMatchLeagueMode) === "production"
-    && readTelegramPrematchFeatureNumber(features.startMatchPairRegimeModerateAccepted) === 1
-    && readTelegramPrematchFeatureNumber(features.startMatchProductionAccepted) === 1
-    && readTelegramPrematchFeatureNumber(features.startMatchLeaguePublishAccepted) === 1;
+    && isTelegramPrematchProductionLeagueName(leagueName)
+    && readTelegramPrematchFeatureNumber(features.startMatchPairRegimeDataReady) === 1
+    && decisionAt > 0
+    && isTelegramResearchDecisionBeforeSettlement(decisionAt, row);
 }
 
 function calculateTelegramWilsonLowerBound(wins, total, z = 1.96) {
