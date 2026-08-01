@@ -4,6 +4,7 @@ if (typeof importScripts === "function") {
   importScripts(
     "../shared/pipeline-policy.js",
     "../shared/start-match-rule.js",
+    "../shared/side-correction-guard.js",
     "../shared/verified-pair-regime-v1.js"
   );
 }
@@ -19,6 +20,9 @@ const TELEGRAM_AUDIT_KEY = "telegramPredictionAudit";
 const TELEGRAM_PREDICTION_DATASET_KEY = "telegramPredictionDataset";
 const TELEGRAM_PREDICTION_DATASET_STORAGE_VERSION_KEY = "telegramPredictionDatasetStorageVersion";
 const TELEGRAM_PREDICTION_DATASET_STORAGE_VERSION = 9;
+const TELEGRAM_START_SIDE_GUARD_SNAPSHOTS_KEY = "telegramStartSideGuardDecisionSnapshots";
+const TELEGRAM_START_SIDE_GUARD_SNAPSHOT_TTL_MS = 48 * 60 * 60 * 1000;
+const TELEGRAM_START_SIDE_GUARD_SNAPSHOT_LIMIT = 1000;
 const LEGACY_TELEGRAM_STORAGE_KEYS = [
   "telegramLiveSettings",
   "telegramLiveSentSignals",
@@ -53,6 +57,9 @@ const TELEGRAM_STATS_EDIT_TIMEOUT_MS = 8000;
 const TELEGRAM_MATCH_START_RULE_ID = String(
   globalThis.LvrStartMatchRule && globalThis.LvrStartMatchRule.RULE_ID || ""
 );
+const TELEGRAM_START_SIDE_GUARD_RULE_ID = String(
+  globalThis.LvrSideCorrectionGuard && globalThis.LvrSideCorrectionGuard.RULE_ID || ""
+);
 const TELEGRAM_START_PAIR_REGIME_PROTOCOL = globalThis.LvrVerifiedPairRegimeV1
   && globalThis.LvrVerifiedPairRegimeV1.PROTOCOL || {};
 const TELEGRAM_START_PAIR_REGIME_PROTOCOL_ID = String(
@@ -62,15 +69,10 @@ const TELEGRAM_START_PAIR_REGIME_PRODUCTION_GATE_ID = String(
   TELEGRAM_START_PAIR_REGIME_PROTOCOL.gateId || ""
 );
 const TELEGRAM_STATS_COMPATIBLE_START_RULE_IDS = new Set([
-  TELEGRAM_MATCH_START_RULE_ID,
-  "match-start-history-pbp-8-5-3-v2"
+  TELEGRAM_MATCH_START_RULE_ID
 ]);
 const TELEGRAM_STATS_COMPATIBLE_PAIR_PROTOCOL_IDS = new Set([
-  TELEGRAM_START_PAIR_REGIME_PROTOCOL_ID,
-  "start-moderate-live-deficit4-v6-2026-07-31",
-  "start-dual-signal-v5-2026-07-30",
-  "start-collapse-salvage-v4-2026-07-28",
-  "start-collapse-salvage-v3-2026-07-28"
+  TELEGRAM_START_PAIR_REGIME_PROTOCOL_ID
 ]);
 const TELEGRAM_MATCH_START_DELIVERY_MAX_AGE_MS = 20000;
 const BSPORTSFAN_PROXY_FETCH_TIMEOUT_MS = 12 * 1000;
@@ -84,6 +86,13 @@ const BSPORTSFAN_PROXY_CACHE_DEFAULT_TTL_MS = 30 * 1000;
 const BSPORTSFAN_PROXY_CACHE_MAX_TTL_MS = 10 * 60 * 1000;
 const BSPORTSFAN_PROXY_CACHE_MAX_ENTRIES = 48;
 const BSPORTSFAN_PROXY_PROTECTION_STORAGE_KEY = "bsportsfanProtectionState";
+const BSPORTSFAN_ATTENTION_NOTIFICATION_KEY = "bsportsfanAttentionNotification";
+const BSPORTSFAN_ATTENTION_NOTIFICATION_TTL_MS = 60 * 60 * 1000;
+const BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS = 6 * 60 * 60 * 1000;
+const BSPORTSFAN_HEALTH_ALARM_NAME = "lvr-bsportsfan-health";
+const BSPORTSFAN_HEALTH_STALE_MS = 2 * 60 * 1000;
+const BSPORTSFAN_HEALTH_RELOAD_COOLDOWN_MS = 15 * 60 * 1000;
+const BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY = "bsportsfanHealthWatchdog";
 const BSPORTSFAN_NAVIGATION_LEASE_STORAGE_KEY = "bsportsfanNavigationLeaseState";
 const BSPORTSFAN_FORECAST_LEASES_STORAGE_KEY = "bsportsfanForecastLeases";
 const BSPORTSFAN_MAINTENANCE_LEASE_STORAGE_KEY = "bsportsfanMaintenanceLease";
@@ -146,7 +155,22 @@ let bsportsfanForecastLeasesLoadPromise = null;
 
 chrome.runtime.onInstalled.addListener(() => {
   ensureBootstrapStorage().catch(() => {});
+  ensureBsportsfanHealthAlarm();
 });
+
+if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === "function") {
+  chrome.runtime.onStartup.addListener(() => {
+    ensureBsportsfanHealthAlarm();
+  });
+}
+
+if (chrome.alarms && chrome.alarms.onAlarm) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm && alarm.name === BSPORTSFAN_HEALTH_ALARM_NAME) {
+      runBsportsfanHealthWatchdog().catch(() => {});
+    }
+  });
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   const bootstrapIndependent = isBootstrapIndependentMessage(message);
@@ -167,6 +191,81 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 ensureBootstrapStorage().catch(() => {});
+ensureBsportsfanHealthAlarm();
+
+function ensureBsportsfanHealthAlarm() {
+  if (!chrome.alarms || typeof chrome.alarms.create !== "function") {
+    return;
+  }
+  try {
+    chrome.alarms.create(BSPORTSFAN_HEALTH_ALARM_NAME, {
+      delayInMinutes: 1,
+      periodInMinutes: 1
+    });
+  } catch (_) {
+    // The parser remains usable when alarms are unavailable.
+  }
+}
+
+async function runBsportsfanHealthWatchdog(now = Date.now()) {
+  await ensureBsportsfanProtectionStateLoaded();
+  if (getBsportsfanProtectionCircuitError(now)) {
+    return { reloaded: false, reason: "protection-active" };
+  }
+  const storage = await chrome.storage.local.get({
+    scanStatus: null,
+    [BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY]: null
+  });
+  const scanStatus = storage.scanStatus && typeof storage.scanStatus === "object"
+    ? storage.scanStatus
+    : null;
+  const source = normalizeTelegramText(scanStatus && scanStatus.source || "").toLowerCase();
+  const recovery = scanStatus && scanStatus.bsportsfan
+    && scanStatus.bsportsfan.sessionRecovery;
+  if (
+    source === "bsportsfan-protection"
+    || scanStatus && scanStatus.bsportsfan && scanStatus.bsportsfan.challenge === true
+    || recovery && recovery.active === true
+  ) {
+    return { reloaded: false, reason: "manual-or-recovery-active" };
+  }
+  const heartbeatAt = Number(scanStatus && scanStatus.ts || 0);
+  if (!(heartbeatAt > 0) || now - heartbeatAt < BSPORTSFAN_HEALTH_STALE_MS) {
+    return { reloaded: false, reason: "heartbeat-healthy" };
+  }
+  const previous = storage[BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY];
+  const lastReloadAt = Number(previous && previous.lastReloadAt || 0);
+  if (lastReloadAt > 0 && now - lastReloadAt < BSPORTSFAN_HEALTH_RELOAD_COOLDOWN_MS) {
+    return { reloaded: false, reason: "reload-cooldown" };
+  }
+  if (!chrome.tabs || typeof chrome.tabs.query !== "function") {
+    return { reloaded: false, reason: "tabs-unavailable" };
+  }
+  const tabs = await chrome.tabs.query({
+    url: ["https://bsportsfan.com/*", "https://*.bsportsfan.com/*"]
+  }).catch(() => []);
+  const candidates = (Array.isArray(tabs) ? tabs : [])
+    .filter((tab) => Number.isInteger(tab && tab.id))
+    .sort((left, right) => {
+      const listRank = (tab) => /\/(?:cip|c)\/table-tennis\/?(?:[?#]|$)/i.test(String(tab && tab.url || "")) ? 0 : 1;
+      return listRank(left) - listRank(right)
+        || Number(Boolean(right && right.active)) - Number(Boolean(left && left.active));
+    });
+  const tab = candidates[0];
+  if (!tab || typeof chrome.tabs.reload !== "function") {
+    return { reloaded: false, reason: "bsportsfan-tab-missing" };
+  }
+  await chrome.storage.local.set({
+    [BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY]: {
+      lastReloadAt: now,
+      tabId: tab.id,
+      heartbeatAt,
+      updatedAt: now
+    }
+  });
+  await chrome.tabs.reload(tab.id);
+  return { reloaded: true, tabId: tab.id, heartbeatAgeMs: now - heartbeatAt };
+}
 
 function isBootstrapIndependentMessage(message) {
   return Boolean(message && [
@@ -175,6 +274,7 @@ function isBootstrapIndependentMessage(message) {
     "lvr:releaseBsportsfanRequestSlot",
     "lvr:reportBsportsfanProtection",
     "lvr:reportBsportsfanHealthy",
+    "lvr:notifyBsportsfanAttention",
     "lvr:prepareBsportsfanLiveSessionRecovery",
     "lvr:openBsportsfanResultsRecovery",
     "lvr:startBsportsfanResultRecovery",
@@ -254,14 +354,34 @@ async function handleMessage(message, sender = null) {
 
   if (message.type === "lvr:reportBsportsfanProtection") {
     await ensureBsportsfanProtectionStateLoaded();
+    const requestedCooldownMs = Math.min(
+      BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS,
+      Math.max(
+        BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS,
+        Number(message.retryAfterMs || 0) || 0
+      )
+    );
     openBsportsfanProtectionCircuit(
       normalizeTelegramText(message.reason || message.code || "bsportsfan-challenge"),
-      Number(message.status || 0) || 0
+      Number(message.status || 0) || 0,
+      requestedCooldownMs
     );
+    const notification = normalizeTelegramText(message.code || "") === "bsportsfan-challenge"
+      ? await notifyBsportsfanAttention(message).catch((error) => ({
+          notified: false,
+          reason: "notification-error",
+          error: stringifyError(error)
+        }))
+      : null;
     return {
       reported: true,
-      retryAfterMs: Math.max(0, bsportsfanProtectionOpenUntil - Date.now())
+      retryAfterMs: Math.max(0, bsportsfanProtectionOpenUntil - Date.now()),
+      notification
     };
+  }
+
+  if (message.type === "lvr:notifyBsportsfanAttention") {
+    return notifyBsportsfanAttention(message);
   }
 
   if (message.type === "lvr:reportBsportsfanHealthy") {
@@ -419,6 +539,13 @@ async function handleMessage(message, sender = null) {
     return sendTelegramPrediction(message.prediction || {});
   }
 
+  if (message.type === "lvr:getStartSideGuardState") {
+    const sideGuardState = await getStartSideGuardState(message.matchUrl || "", {
+      freeze: message.freeze !== false
+    });
+    return { sideGuardState };
+  }
+
   if (message.type === "lvr:updateTelegramPredictionResult") {
     return updateTelegramPredictionResult(message.result || {});
   }
@@ -431,7 +558,15 @@ async function handleMessage(message, sender = null) {
   if (message.type === "lvr:recordTelegramPredictionDataset") {
     const rawRecord = message.record || message.entry || {};
     const datasetRecord = await saveTelegramPredictionDatasetFromRecord(rawRecord);
-    return { recorded: Boolean(datasetRecord), record: datasetRecord, datasetRecord };
+    const statsMessage = datasetRecord
+      ? scheduleTelegramStatsRefresh("match-processed", { force: true })
+      : null;
+    return {
+      recorded: Boolean(datasetRecord),
+      record: datasetRecord,
+      datasetRecord,
+      statsMessage
+    };
   }
 
   if (message.type === "lvr:patchTelegramPredictionHistoricalOpeningOdds") {
@@ -656,6 +791,15 @@ function normalizeBsportsfanRequestPriority(value) {
     : Math.max(0, Math.min(4, Number.isFinite(Number(value)) ? Number(value) : 2));
 }
 
+function getBsportsfanRequestIntervalMs(priority) {
+  const normalized = normalizeBsportsfanRequestPriority(priority);
+  if (normalized <= 0) return BSPORTSFAN_PROXY_FETCH_MIN_INTERVAL_MS;
+  if (normalized === 1) return 3000;
+  if (normalized === 2) return 4000;
+  if (normalized === 3) return 6000;
+  return 8000;
+}
+
 function compareBsportsfanProxyFetchJobs(left, right) {
   const policy = globalThis.LvrPipelinePolicy;
   if (policy && typeof policy.compareRequestJobs === "function") {
@@ -751,6 +895,50 @@ function isSameBsportsfanRequestOwner(leftValue, rightValue) {
   return Boolean(left && right && left === right);
 }
 
+async function notifyBsportsfanAttention(value = {}) {
+  const now = Date.now();
+  const storage = await chrome.storage.local.get({
+    [BSPORTSFAN_ATTENTION_NOTIFICATION_KEY]: null
+  });
+  const previous = storage && storage[BSPORTSFAN_ATTENTION_NOTIFICATION_KEY];
+  const previousAt = Number(previous && previous.notifiedAt || 0);
+  if (previousAt > 0 && now - previousAt < BSPORTSFAN_ATTENTION_NOTIFICATION_TTL_MS) {
+    return {
+      notified: false,
+      reason: "notification-cooldown",
+      retryAfterMs: BSPORTSFAN_ATTENTION_NOTIFICATION_TTL_MS - (now - previousAt)
+    };
+  }
+
+  const kind = normalizeTelegramText(value.kind || value.code || "security-challenge");
+  await chrome.storage.local.set({
+    [BSPORTSFAN_ATTENTION_NOTIFICATION_KEY]: {
+      kind,
+      notifiedAt: now,
+      observedAt: Number(value.observedAt || 0) || now
+    }
+  });
+
+  const settings = await getTelegramSettings();
+  if (!settings.enabled || !settings.botToken || !settings.chatId) {
+    return { notified: false, reason: "telegram-disabled" };
+  }
+  const sessionExpired = kind === "session-expired";
+  const text = sessionExpired
+    ? [
+        "🟠 <b>BSportsFan требует внимания</b>",
+        "Сессия не восстановилась после двух безопасных попыток.",
+        "Сбор остановлен. Откройте вкладку сайта и нажмите Refresh to Reconnect."
+      ].join("\n")
+    : [
+        "🔴 <b>BSportsFan требует внимания</b>",
+        "Сайт включил проверку безопасности.",
+        "Сбор и запросы остановлены. Откройте вкладку и завершите проверку вручную."
+      ].join("\n");
+  const result = await sendTelegramMessage(text, settings);
+  return { notified: true, result };
+}
+
 async function prepareBsportsfanLiveSessionRecovery(sender) {
   validateBsportsfanProxySender(sender);
   const owner = getBsportsfanRequestOwner(sender);
@@ -765,55 +953,29 @@ async function prepareBsportsfanLiveSessionRecovery(sender) {
     "bsportsfan-session-expired"
   );
   sessionError.retryAfterMs = 0;
-
   const queuedBefore = bsportsfanProxyFetchQueue.length;
-  rejectQueuedBsportsfanProxyFetches(sessionError, (job) => (
-    !normalizeTelegramText(job && job.owner || "")
-    || isSameBsportsfanRequestOwner(job && job.owner, owner)
-  ));
+  const hadNavigationLease = Boolean(bsportsfanNavigationLeaseToken);
+  openBsportsfanProtectionCircuit(
+    "bsportsfan-session-recovery",
+    0,
+    5 * 60 * 1000
+  );
+
   let activeCancelled = 0;
   for (const job of bsportsfanProxyActiveJobs) {
-    if (
-      normalizeTelegramText(job && job.owner || "")
-      && !isSameBsportsfanRequestOwner(job && job.owner, owner)
-    ) {
-      continue;
-    }
     if (job && job.abortController && !job.abortController.signal.aborted) {
       job.abortController.abort(sessionError);
       activeCancelled += 1;
     }
   }
 
-  const navigationReleased = Boolean(
-    bsportsfanNavigationLeaseToken
-    && (
-      !bsportsfanNavigationLeaseOwner
-      || isSameBsportsfanRequestOwner(bsportsfanNavigationLeaseOwner, owner)
-    )
-    && releaseBsportsfanNavigationLease(bsportsfanNavigationLeaseToken, true).released
-  );
+  const navigationReleased = hadNavigationLease && !bsportsfanNavigationLeaseToken;
 
-  let forecastLeasesReleased = 0;
-  for (const [key, lease] of bsportsfanForecastLeases.entries()) {
-    if (
-      normalizeTelegramText(lease && lease.owner || "")
-      && !isSameBsportsfanRequestOwner(lease && lease.owner, owner)
-    ) {
-      continue;
-    }
-    bsportsfanForecastLeases.delete(key);
-    forecastLeasesReleased += 1;
-  }
+  const forecastLeasesReleased = bsportsfanForecastLeases.size;
+  bsportsfanForecastLeases.clear();
 
   let maintenanceReleased = false;
-  if (
-    bsportsfanResultBackfillLeaseToken
-    && (
-      !bsportsfanResultBackfillLeaseOwner
-      || isSameBsportsfanRequestOwner(bsportsfanResultBackfillLeaseOwner, owner)
-    )
-  ) {
+  if (bsportsfanResultBackfillLeaseToken) {
     bsportsfanResultBackfillLeaseUntil = 0;
     bsportsfanResultBackfillLeaseOwner = "";
     bsportsfanResultBackfillLeaseToken = "";
@@ -1013,7 +1175,7 @@ function drainBsportsfanProxyFetchQueue() {
     const waitMs = Math.max(
       0,
       Number(bsportsfanProxyFetchLastStartedAt || 0)
-        + BSPORTSFAN_PROXY_FETCH_MIN_INTERVAL_MS
+        + getBsportsfanRequestIntervalMs(job.priority)
         - Date.now()
     );
     if (waitMs > 0) {
@@ -1292,12 +1454,19 @@ async function fetchBsportsfanText(value, options = {}) {
       );
       error.status = status;
       if (protectionResponse) {
-        if (status === 429) {
-          openBsportsfanProtectionCircuit(
-            error.code,
-            status,
-            BSPORTSFAN_PROXY_REQUEST_RETRY_MS
-          );
+        openBsportsfanProtectionCircuit(
+          error.code,
+          status,
+          status === 403
+            ? BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS
+            : BSPORTSFAN_PROXY_REQUEST_RETRY_MS
+        );
+        if (status === 403) {
+          notifyBsportsfanAttention({
+            kind: "security-challenge",
+            code: error.code,
+            observedAt: Date.now()
+          }).catch(() => {});
         }
         error.retryAfterMs = BSPORTSFAN_PROXY_REQUEST_RETRY_MS;
       }
@@ -1311,7 +1480,17 @@ async function fetchBsportsfanText(value, options = {}) {
         "bsportsfan-challenge"
       );
       error.status = Number(response.status || 0) || 0;
-      error.retryAfterMs = BSPORTSFAN_PROXY_REQUEST_RETRY_MS;
+      error.retryAfterMs = BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS;
+      openBsportsfanProtectionCircuit(
+        error.code,
+        error.status,
+        BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS
+      );
+      notifyBsportsfanAttention({
+        kind: "security-challenge",
+        code: error.code,
+        observedAt: Date.now()
+      }).catch(() => {});
       throw error;
     }
     if (isBsportsfanLiveSessionExpiredResponse(text)) {
@@ -2153,6 +2332,242 @@ async function saveTelegramPredictionDatasetFromPrediction(prediction, matchUrlV
   return updated;
 }
 
+async function getStartSideGuardState(matchUrlValue, options = {}) {
+  const matchUrl = normalizeTelegramMatchKey(matchUrlValue || "");
+  return enqueueTelegramPredictionDatasetMutation(async () => {
+    const value = await chrome.storage.local.get({
+      [TELEGRAM_PREDICTION_DATASET_KEY]: [],
+      [TELEGRAM_START_SIDE_GUARD_SNAPSHOTS_KEY]: {}
+    });
+    const rows = Array.isArray(value[TELEGRAM_PREDICTION_DATASET_KEY])
+      ? value[TELEGRAM_PREDICTION_DATASET_KEY]
+      : [];
+    const matchIdentity = getTelegramMatchIdentityKey(matchUrl);
+    const existing = rows.find((row) => (
+      row && getTelegramMatchIdentityKey(row.matchUrl || "") === matchIdentity
+    ));
+    const frozen = readFrozenStartSideGuardState(existing);
+    if (frozen) {
+      return frozen;
+    }
+    const snapshotMap = value[TELEGRAM_START_SIDE_GUARD_SNAPSHOTS_KEY]
+      && typeof value[TELEGRAM_START_SIDE_GUARD_SNAPSHOTS_KEY] === "object"
+      ? value[TELEGRAM_START_SIDE_GUARD_SNAPSHOTS_KEY]
+      : {};
+    const cached = matchIdentity ? snapshotMap[matchIdentity] : null;
+    if (
+      options.freeze !== false
+      && cached
+      && cached.ruleId === TELEGRAM_START_SIDE_GUARD_RULE_ID
+      && Array.isArray(cached.pairedOutcomes)
+      && Number(cached.stateCutoffAt || 0) > 0
+      && readTelegramPrematchFeatureText(cached.stateHash)
+      && Date.now() - Number(cached.frozenAt || 0) < TELEGRAM_START_SIDE_GUARD_SNAPSHOT_TTL_MS
+    ) {
+      return {
+        ...cached,
+        source: "frozen-decision-snapshot"
+      };
+    }
+
+    const stateCutoffAt = Date.now();
+    const entries = rows
+      .map((row) => buildStartSideGuardLedgerEntry(row, stateCutoffAt, matchIdentity))
+      .filter(Boolean)
+      .sort((left, right) => (
+        Number(left.settledAt || 0) - Number(right.settledAt || 0)
+        || Number(left.decisionAt || 0) - Number(right.decisionAt || 0)
+        || String(left.matchIdentity || "").localeCompare(String(right.matchIdentity || ""))
+      ));
+    const windowSize = Number(
+      globalThis.LvrSideCorrectionGuard
+      && globalThis.LvrSideCorrectionGuard.WINDOW_SIZE
+      || 3
+    );
+    const windowEntries = entries.slice(-windowSize);
+    const pairedOutcomes = windowEntries.map((entry) => entry.outcome);
+    const latestWindowEntry = windowEntries.length
+      ? windowEntries[windowEntries.length - 1]
+      : null;
+    const stateHash = globalThis.LvrSideCorrectionGuard
+      && typeof globalThis.LvrSideCorrectionGuard.hashPayload === "function"
+      ? globalThis.LvrSideCorrectionGuard.hashPayload({
+          ruleId: TELEGRAM_START_SIDE_GUARD_RULE_ID,
+          stateCutoffAt,
+          entries: windowEntries
+        })
+      : "";
+    const sideGuardState = {
+      schemaVersion: 1,
+      ruleId: TELEGRAM_START_SIDE_GUARD_RULE_ID,
+      pairedOutcomes,
+      qualifyingSettled: pairedOutcomes.length,
+      sourceCount: entries.length,
+      stateCutoffAt,
+      stateThroughSettledAt: Number(latestWindowEntry && latestWindowEntry.settledAt || 0),
+      stateHash,
+      source: entries.length ? "canonical-archive-causal" : "empty-history"
+    };
+    if (options.freeze !== false && matchIdentity) {
+      const nextSnapshots = pruneStartSideGuardDecisionSnapshots({
+        ...snapshotMap,
+        [matchIdentity]: {
+          ...sideGuardState,
+          matchIdentity,
+          frozenAt: Date.now()
+        }
+      });
+      await chrome.storage.local.set({
+        [TELEGRAM_START_SIDE_GUARD_SNAPSHOTS_KEY]: nextSnapshots
+      });
+    }
+    return sideGuardState;
+  });
+}
+
+function pruneStartSideGuardDecisionSnapshots(value, now = Date.now()) {
+  return Object.fromEntries(Object.entries(value && typeof value === "object" ? value : {})
+    .filter(([, snapshot]) => (
+      snapshot
+      && snapshot.ruleId === TELEGRAM_START_SIDE_GUARD_RULE_ID
+      && Number(snapshot.frozenAt || 0) > 0
+      && Number(now) - Number(snapshot.frozenAt || 0) < TELEGRAM_START_SIDE_GUARD_SNAPSHOT_TTL_MS
+    ))
+    .sort((left, right) => Number(right[1].frozenAt || 0) - Number(left[1].frozenAt || 0))
+    .slice(0, TELEGRAM_START_SIDE_GUARD_SNAPSHOT_LIMIT));
+}
+
+function readFrozenStartSideGuardState(row) {
+  const prematch = row && (row.prematchSnapshot || row.prematch);
+  const features = prematch && prematch.features && typeof prematch.features === "object"
+    ? prematch.features
+    : {};
+  if (
+    readTelegramPrematchFeatureText(features.startMatchSideGuardRuleId)
+      !== TELEGRAM_START_SIDE_GUARD_RULE_ID
+    || !readTelegramPrematchFeatureText(features.startMatchSideGuardInputHash)
+    || !readTelegramPrematchFeatureText(features.startMatchSideGuardStateHash)
+    || !(readTelegramPrematchFeatureNumber(features.startMatchSideGuardStateCutoffAt) > 0)
+  ) {
+    return null;
+  }
+  const pairedOutcomes = globalThis.LvrSideCorrectionGuard
+    && typeof globalThis.LvrSideCorrectionGuard.normalizeOutcomes === "function"
+    ? globalThis.LvrSideCorrectionGuard.normalizeOutcomes(
+        Array.isArray(features.startMatchSideGuardPairOutcomes)
+          ? features.startMatchSideGuardPairOutcomes
+          : []
+      )
+    : [];
+  return {
+    schemaVersion: 1,
+    ruleId: TELEGRAM_START_SIDE_GUARD_RULE_ID,
+    pairedOutcomes,
+    qualifyingSettled: Number(features.startMatchSideGuardQualifyingSettled || pairedOutcomes.length),
+    sourceCount: Number(features.startMatchSideGuardStateSourceCount || pairedOutcomes.length),
+    stateCutoffAt: Number(features.startMatchSideGuardStateCutoffAt || 0),
+    stateThroughSettledAt: Number(features.startMatchSideGuardStateThroughSettledAt || 0),
+    stateHash: readTelegramPrematchFeatureText(features.startMatchSideGuardStateHash),
+    source: "frozen-match-decision"
+  };
+}
+
+function buildStartSideGuardLedgerEntry(row, stateCutoffAt, excludedMatchIdentity = "") {
+  const prematch = row && (row.prematchSnapshot || row.prematch);
+  if (!prematch || typeof prematch !== "object") return null;
+  const matchIdentity = getTelegramMatchIdentityKey(row && row.matchUrl || prematch.matchUrl || "");
+  if (!matchIdentity || matchIdentity === excludedMatchIdentity) return null;
+  const features = {
+    ...(prematch.audit && prematch.audit.decision && prematch.audit.decision.features || {}),
+    ...(prematch.features || {})
+  };
+  const leagueName = readTelegramPrematchFeatureText(
+    prematch.leagueName,
+    features.leagueName,
+    row && row.leagueName,
+    prematch.audit && prematch.audit.league && prematch.audit.league.name
+  );
+  if (!isTelegramPrematchProductionLeagueName(leagueName)) {
+    return null;
+  }
+  const decisionAt = getTelegramPrematchDecisionAt(prematch, row);
+  const settledAt = getTelegramPredictionSettledAt(row);
+  if (
+    !(decisionAt > 0)
+    || !(settledAt > decisionAt)
+    || !(settledAt < Number(stateCutoffAt || 0))
+  ) {
+    return null;
+  }
+  const result = getTelegramPredictionDatasetResult(row) || {};
+  if (!["same", "reversed", "same-trusted-match-page"].includes(
+    normalizeTelegramText(result.resultOrientation || "")
+  )) {
+    return null;
+  }
+  const score = parseTelegramFinalScore(result.finalScore || row && (row.finalScore || row.actualScore) || "");
+  const profiles = features.startMatchProfiles;
+  const players = Array.isArray(prematch.players)
+    ? prematch.players.slice(0, 2).map(normalizeTelegramText)
+    : [];
+  const guardApi = globalThis.LvrSideCorrectionGuard;
+  const startApi = globalThis.LvrStartMatchRule;
+  const pairApi = globalThis.LvrVerifiedPairRegimeV1;
+  if (
+    !score
+    || !Array.isArray(profiles)
+    || profiles.length !== 2
+    || !startApi
+    || typeof startApi.evaluate !== "function"
+    || !pairApi
+    || typeof pairApi.evaluate !== "function"
+    || !guardApi
+    || typeof guardApi.pairedOutcome !== "function"
+  ) {
+    return null;
+  }
+  const evaluation = startApi.evaluate({ profiles, players });
+  const historySideIndex = evaluation && evaluation.eligible
+    ? sanitizeCalibrationSideIndex(evaluation.sideIndex)
+    : null;
+  const baseSideIndex = evaluation && evaluation.eligible
+    ? sanitizeCalibrationSideIndex(evaluation.baseSideIndex)
+    : null;
+  const pairRegime = evaluation && evaluation.eligible
+    ? pairApi.evaluate({
+        profiles,
+        selectedSideIndex: evaluation.sideIndex,
+        pointWindowSize: evaluation.pointWindowSize,
+        relativeAgreementScore: evaluation.sideCorrection && evaluation.sideCorrection.agreementScore,
+        latestPbpReversal: evaluation.sideCorrection && evaluation.sideCorrection.latestReversal,
+        leagueName
+      })
+    : null;
+  if (
+    historySideIndex === null
+    || baseSideIndex === null
+    || historySideIndex === baseSideIndex
+    || !pairRegime
+    || pairRegime.accepted !== true
+    || pairRegime.productionLeague !== true
+  ) {
+    return null;
+  }
+  const outcome = guardApi.pairedOutcome({
+    historySideIndex,
+    baseSideIndex,
+    leftSets: score.left,
+    rightSets: score.right
+  });
+  if (outcome !== -1 && outcome !== 0 && outcome !== 1) return null;
+  return {
+    matchIdentity,
+    decisionAt,
+    settledAt,
+    outcome
+  };
+}
+
 function selectTelegramPredictionDatasetPrematch(existing, incoming) {
   const current = existing && typeof existing === "object" ? existing : null;
   const next = incoming && typeof incoming === "object" ? incoming : null;
@@ -2232,7 +2647,8 @@ async function clearTelegramPredictionDataset() {
       chrome.storage.local.set({
         [TELEGRAM_PREDICTION_DATASET_KEY]: [],
         [TELEGRAM_PREDICTION_DATASET_STORAGE_VERSION_KEY]: TELEGRAM_PREDICTION_DATASET_STORAGE_VERSION,
-        [TELEGRAM_MESSAGE_REFS_KEY]: {}
+        [TELEGRAM_MESSAGE_REFS_KEY]: {},
+        [TELEGRAM_START_SIDE_GUARD_SNAPSHOTS_KEY]: {}
       }),
       clearTelegramPredictionPointRecords()
     ]);
@@ -3299,6 +3715,10 @@ function buildTelegramPredictionDatasetPrematch(prediction, matchUrl, outcome = 
     requestedAt: finitePredictionDatasetNumber(source.requestedAt),
     collectionStartedAt: finitePredictionDatasetNumber(source.collectionStartedAt),
     readyAt: finitePredictionDatasetNumber(source.readyAt),
+    finalDecisionAt: finitePredictionDatasetNumber(
+      source.finalDecisionAt
+      || source.audit && source.audit.decision && source.audit.decision.finalDecisionAt
+    ),
     collectionLatencyMs: finitePredictionDatasetNumber(source.collectionLatencyMs),
     deliveryObservedAt: finitePredictionDatasetNumber(source.deliveryObservedAt),
     deliveryMode: normalizeTelegramText(source.deliveryMode || source.deliveryEntryState && source.deliveryEntryState.mode || ""),
@@ -3430,6 +3850,11 @@ function buildTelegramPredictionDatasetResult(record, finalScore, result = {}) {
   const canonicalSetScores = score
     ? orientTelegramResultSetScores(source.setScores, alignment.orientation)
     : [];
+  const sideGuardPairedOutcome = ["same", "reversed", "same-trusted-match-page"].includes(
+    normalizeTelegramText(alignment.orientation || "")
+  )
+    ? buildTelegramSideGuardPairedOutcome(record, score)
+    : null;
   return compactTelegramPredictionDatasetValue({
     finalScore: canonicalFinalScore,
     observedFinalScore: normalizeTelegramFinalScore(finalScore),
@@ -3445,9 +3870,52 @@ function buildTelegramPredictionDatasetResult(record, finalScore, result = {}) {
     ownSets,
     status,
     targetTookTwoSets: ownSets === null ? null : Number(ownSets) >= 2,
+    sideGuardPairedOutcome,
     observedAt,
     settledAt: status ? observedAt : 0
   });
+}
+
+function buildTelegramSideGuardPairedOutcome(record, score) {
+  if (!score) return null;
+  const prematch = record && (record.prematchSnapshot || record.prematch) || {};
+  const features = prematch.features && typeof prematch.features === "object"
+    ? prematch.features
+    : {};
+  if (
+    readTelegramPrematchFeatureText(features.startMatchSideGuardRuleId)
+      !== TELEGRAM_START_SIDE_GUARD_RULE_ID
+  ) {
+    return null;
+  }
+  const historySideIndex = sanitizeCalibrationSideIndex(
+    features.startMatchSideGuardHistorySideIndex
+  );
+  const baseSideIndex = sanitizeCalibrationSideIndex(
+    features.startMatchSideGuardBaseSideIndex
+  );
+  if (
+    historySideIndex === null
+    || baseSideIndex === null
+    || historySideIndex === baseSideIndex
+  ) {
+    return null;
+  }
+  const historyOwnSets = historySideIndex === 0 ? score.left : score.right;
+  const baseOwnSets = baseSideIndex === 0 ? score.left : score.right;
+  const historyHit = historyOwnSets >= 2;
+  const baseHit = baseOwnSets >= 2;
+  const outcome = historyHit === baseHit ? 0 : historyHit ? 1 : -1;
+  return {
+    ruleId: TELEGRAM_START_SIDE_GUARD_RULE_ID,
+    historySideIndex,
+    baseSideIndex,
+    historyOwnSets,
+    baseOwnSets,
+    historyHit,
+    baseHit,
+    outcome
+  };
 }
 
 function orientTelegramResultSetScores(value, orientation) {
@@ -3923,6 +4391,21 @@ function sanitizeCalibrationFeatureMap(features) {
       result[safeKey] = compactCalibrationValue(value, 7);
       continue;
     }
+    if (
+      safeKey === "startMatchPairRegimeMarketSnapshot"
+      && value
+      && typeof value === "object"
+    ) {
+      result[safeKey] = compactCalibrationValue(value, 3);
+      continue;
+    }
+    if (safeKey === "startMatchSideGuardPairOutcomes" && Array.isArray(value)) {
+      result[safeKey] = value
+        .map(Number)
+        .filter((item) => item === -1 || item === 0 || item === 1)
+        .slice(-3);
+      continue;
+    }
     const number = finiteAuditNumber(value);
     if (number !== null) {
       result[safeKey] = number;
@@ -4093,10 +4576,9 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
     source && source.action
   ).toLowerCase();
   if (
-    normalizeTelegramText(source && source.oddsMeaning || "").toLowerCase() !== "none"
-    || source && source.moneylineMarket
-    || Number(features.startMatchUsesOdds) !== 0
-    || Number(features.startMatchUsesCurrentScore) !== 1
+    normalizeTelegramText(source && source.oddsMeaning || "").toLowerCase()
+      !== "optional-prematch-market-consensus"
+    || Number(features.startMatchUsesCurrentScore) !== 0
   ) {
     return { applies: true, accepted: false, reason: "match-start-forbidden-input" };
   }
@@ -4104,8 +4586,6 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
   const startApi = globalThis.LvrStartMatchRule;
   const pairApi = globalThis.LvrVerifiedPairRegimeV1;
   const startEvaluator = startApi && startApi.evaluate;
-  const livePointCorrectionEvaluator = startApi && startApi.applyLivePointDeficitCorrection;
-  const decisionInputHashEvaluator = startApi && startApi.fingerprintDecision;
   const pairEvaluator = pairApi && pairApi.evaluate;
   const profiles = features.startMatchProfiles || detailsFeatures.startMatchProfiles;
   const players = Array.isArray(source && source.players)
@@ -4113,8 +4593,6 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
     : [];
   if (
     typeof startEvaluator !== "function"
-    || typeof livePointCorrectionEvaluator !== "function"
-    || typeof decisionInputHashEvaluator !== "function"
     || typeof pairEvaluator !== "function"
     || !Array.isArray(profiles)
     || profiles.length !== 2
@@ -4124,16 +4602,6 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
   }
 
   const evaluation = startEvaluator({ profiles, players });
-  const livePointCorrection = livePointCorrectionEvaluator({
-    selectedSideIndex: evaluation.sideIndex,
-    deliveryEntryState: source && source.deliveryEntryState
-  });
-  const decisionInputHash = decisionInputHashEvaluator({
-    profiles,
-    selectedSideIndex: evaluation.sideIndex,
-    deliveryEntryState: source && source.deliveryEntryState
-  });
-  const expectedSide = livePointCorrection.finalSideIndex;
   const leagueName = readTelegramPrematchFeatureText(
     source && source.leagueName,
     features.leagueName,
@@ -4141,14 +4609,23 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
     source && source.audit && source.audit.decision && source.audit.decision.leagueName,
     source && source.audit && source.audit.league && source.audit.league.name
   );
+  const decisionAt = Number(
+    source && source.finalDecisionAt
+    || source && source.audit && source.audit.decision && source.audit.decision.finalDecisionAt
+    || 0
+  );
   const pairRegime = pairEvaluator({
     profiles,
     selectedSideIndex: evaluation.sideIndex,
     pointWindowSize: evaluation.pointWindowSize,
     relativeAgreementScore: evaluation.sideCorrection && evaluation.sideCorrection.agreementScore,
     latestPbpReversal: evaluation.sideCorrection && evaluation.sideCorrection.latestReversal,
-    leagueName
+    leagueName,
+    moneylineMarket: source && source.referenceMoneylineMarket || null,
+    decisionAt
   });
+  const expectedSide = pairRegime.selectedSideIndex;
+  const decisionInputHash = pairRegime.inputHash;
   const readText = (key) => readTelegramPrematchFeatureText(features[key], detailsFeatures[key]);
   const readNumber = (key) => readTelegramPrematchFeatureNumber(features[key], detailsFeatures[key]);
   const storedSide = readTelegramPrematchFeatureNumber(
@@ -4158,37 +4635,84 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
   );
   const sourceSide = sanitizeCalibrationSideIndex(source && source.sideIndex);
   const playerName = normalizeTelegramText(source && source.playerName || "");
+  const frozenMarket = source && source.referenceMoneylineMarket
+    && typeof source.referenceMoneylineMarket === "object"
+    ? source.referenceMoneylineMarket
+    : null;
+  const storedMarketSnapshot = features.startMatchPairRegimeMarketSnapshot
+    || detailsFeatures.startMatchPairRegimeMarketSnapshot
+    || null;
+  const marketSalvageMinimum = Number(
+    pairApi && pairApi.THRESHOLDS
+    && pairApi.THRESHOLDS.marketSalvageFavoriteProbabilityMinimum
+  );
+  const marketOverrideMinimum = Number(
+    pairApi && pairApi.THRESHOLDS
+    && pairApi.THRESHOLDS.marketSideOverrideFavoriteProbabilityMinimum
+  );
+  const expectedMarketSalvage = Boolean(
+    pairRegime.marketReady
+    && pairRegime.marketFavoriteSideIndex === pairRegime.baseSelectedSideIndex
+    && Number(pairRegime.marketFavoriteProbability) >= marketSalvageMinimum
+  );
+  const expectedMarketOverride = Boolean(
+    pairRegime.marketReady
+    && (pairRegime.marketFavoriteSideIndex === 0 || pairRegime.marketFavoriteSideIndex === 1)
+    && pairRegime.marketFavoriteSideIndex !== pairRegime.baseSelectedSideIndex
+    && Number(pairRegime.marketFavoriteProbability) >= marketOverrideMinimum
+  );
 
   if (
     !evaluation.eligible
     || evaluation.inputHash !== readText("startMatchInputHash")
     || decisionInputHash !== readText("startMatchDecisionInputHash")
     || evaluation.formulaId !== readText("startMatchFormulaId")
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchZ0Score"),
+      evaluation.z0Score
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchZ0LeftP"),
+      evaluation.z0Inputs && evaluation.z0Inputs[0] && evaluation.z0Inputs[0].latestStrengthScore
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchZ0RightP"),
+      evaluation.z0Inputs && evaluation.z0Inputs[1] && evaluation.z0Inputs[1].latestStrengthScore
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchZ0LeftS3"),
+      evaluation.z0Inputs && evaluation.z0Inputs[0] && evaluation.z0Inputs[0].history3SetSharePct
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchZ0RightS3"),
+      evaluation.z0Inputs && evaluation.z0Inputs[1] && evaluation.z0Inputs[1].history3SetSharePct
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchZ0LeftL"),
+      evaluation.z0Inputs && evaluation.z0Inputs[0] && evaluation.z0Inputs[0].latestOwnSets
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchZ0RightL"),
+      evaluation.z0Inputs && evaluation.z0Inputs[1] && evaluation.z0Inputs[1].latestOwnSets
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchZ0LeftF3"),
+      evaluation.z0Inputs && evaluation.z0Inputs[0] && evaluation.z0Inputs[0].freshForm3Score
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchZ0RightF3"),
+      evaluation.z0Inputs && evaluation.z0Inputs[1] && evaluation.z0Inputs[1].freshForm3Score
+    )
     || evaluation.coverageTier !== readText("startMatchCoverageTier")
     || expectedSide !== storedSide
     || sourceSide !== storedSide
     || storedSide !== 0 && storedSide !== 1
     || !areTelegramNamesSame(playerName, players[storedSide] || "")
     || readNumber("startMatchHistorySelectedSideIndex") !== evaluation.sideIndex
-    || readText("startMatchLivePointCorrectionRuleId") !== livePointCorrection.ruleId
-    || readNumber("startMatchLivePointCorrectionApplied") !== (livePointCorrection.applied ? 1 : 0)
-    || !telegramPairRegimeOptionalNumbersEqual(
-      readNumber("startMatchLivePointCorrectionThreshold"),
-      livePointCorrection.threshold
-    )
-    || !telegramPairRegimeOptionalNumbersEqual(
-      readNumber("startMatchLivePointCorrectionSelectedLead"),
-      livePointCorrection.selectedPointLead
-    )
-    || !telegramPairRegimeOptionalNumbersEqual(
-      readNumber("startMatchLivePointCorrectionLeftPoints"),
-      livePointCorrection.leftPoints
-    )
-    || !telegramPairRegimeOptionalNumbersEqual(
-      readNumber("startMatchLivePointCorrectionRightPoints"),
-      livePointCorrection.rightPoints
-    )
-    || readText("startMatchLivePointCorrectionReason") !== livePointCorrection.reason
+    || readNumber("startMatchBaseSelectedSideIndex") !== evaluation.sideIndex
+    || readText("startMatchDecisionInputHash") !== pairRegime.inputHash
+    || !(decisionAt > 0)
+    || decisionAt > Date.now() + 2000
     || Number(features.startMatchAccepted) !== 1
     || !isTelegramPrematchProductionLeagueName(leagueName)
     || readText("startMatchLeagueMode") !== "production"
@@ -4199,7 +4723,7 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
     || pairRegime.protocolId !== TELEGRAM_START_PAIR_REGIME_PROTOCOL_ID
     || pairRegime.gateId !== TELEGRAM_START_PAIR_REGIME_PRODUCTION_GATE_ID
     || pairRegime.selectorFormulaId !== evaluation.formulaId
-    || pairRegime.selectedSideIndex !== evaluation.sideIndex
+    || pairRegime.baseSelectedSideIndex !== evaluation.sideIndex
     || !["setka", "czech"].includes(pairRegime.leagueClass)
     || readText("startMatchProductionGateId") !== TELEGRAM_START_PAIR_REGIME_PRODUCTION_GATE_ID
     || readText("startMatchPairRegimeProtocolId") !== pairRegime.protocolId
@@ -4209,6 +4733,58 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
     || readText("startMatchPairRegimeLeagueClass") !== pairRegime.leagueClass
     || readText("startMatchPairRegimeReason") !== pairRegime.reason
     || readNumber("startMatchPairRegimeSelectedSideIndex") !== pairRegime.selectedSideIndex
+    || readNumber("startMatchPairRegimeBaseSelectedSideIndex") !== pairRegime.baseSelectedSideIndex
+    || readNumber("startMatchPairRegimeMarketReady") !== (pairRegime.marketReady ? 1 : 0)
+    || readText("startMatchPairRegimeMarketReason") !== pairRegime.marketReason
+    || readText("startMatchPairRegimeMarketType") !== pairRegime.marketType
+    || readText("startMatchPairRegimeMarketQuoteSource") !== pairRegime.marketQuoteSource
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketObservedAt"),
+      pairRegime.marketObservedAt
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketDecisionAt"),
+      pairRegime.marketDecisionAt
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketLeftOdds"),
+      pairRegime.marketLeftOdds
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketRightOdds"),
+      pairRegime.marketRightOdds
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketLeftImpliedProbability"),
+      pairRegime.marketLeftImpliedProbability
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketRightImpliedProbability"),
+      pairRegime.marketRightImpliedProbability
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketFavoriteSideIndex"),
+      pairRegime.marketFavoriteSideIndex
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketFavoriteProbability"),
+      pairRegime.marketFavoriteProbability
+    )
+    || readNumber("startMatchPairRegimeMarketSideOverrideApplied")
+      !== (pairRegime.marketSideOverrideApplied ? 1 : 0)
+    || readNumber("startMatchPairRegimeMarketSalvageAccepted")
+      !== (pairRegime.marketSalvageAccepted ? 1 : 0)
+    || pairRegime.marketSalvageAccepted !== expectedMarketSalvage
+    || pairRegime.marketSideOverrideApplied !== expectedMarketOverride
+    || !telegramPairRegimeMarketSnapshotsEqual(
+      storedMarketSnapshot,
+      pairRegime.marketSnapshot
+    )
+    || !isTelegramPairRegimeFrozenMarketValid(
+      frozenMarket,
+      pairRegime,
+      decisionAt
+    )
     || !telegramPairRegimeOptionalNumbersEqual(
       readNumber("startMatchPairRegimePointWindowSize"),
       pairRegime.pointWindowSize
@@ -4314,6 +4890,7 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
       !== (pairRegime.relativeFormSetShareException ? 1 : 0)
     || readNumber("startMatchProductionAccepted") !== (pairRegime.accepted ? 1 : 0)
     || readNumber("startMatchLeaguePublishAccepted") !== (pairRegime.accepted ? 1 : 0)
+    || readNumber("startMatchUsesOdds") !== (pairRegime.marketReady ? 1 : 0)
   ) {
     return { applies: true, accepted: false, reason: "match-start-pair-regime-mismatch" };
   }
@@ -4345,6 +4922,11 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
 }
 
 function telegramPairRegimeOptionalNumbersEqual(left, right) {
+  const leftMissing = left === null || left === undefined || left === "" || Number.isNaN(left);
+  const rightMissing = right === null || right === undefined || right === "" || Number.isNaN(right);
+  if (leftMissing || rightMissing) {
+    return leftMissing && rightMissing;
+  }
   const leftNumber = Number(left);
   const rightNumber = Number(right);
   const leftFinite = Number.isFinite(leftNumber);
@@ -4352,7 +4934,120 @@ function telegramPairRegimeOptionalNumbersEqual(left, right) {
   if (!leftFinite || !rightFinite) {
     return !leftFinite && !rightFinite;
   }
-  return Math.abs(leftNumber - rightNumber) <= 1e-12;
+  return Math.abs(leftNumber - rightNumber) <= 1e-6;
+}
+
+function telegramPairRegimeMarketSnapshotsEqual(stored, expected) {
+  if (!stored || typeof stored !== "object" || !expected || typeof expected !== "object") {
+    return !stored && !expected;
+  }
+  return normalizeTelegramText(stored.status || "") === normalizeTelegramText(expected.status || "")
+    && normalizeTelegramText(stored.marketType || "") === normalizeTelegramText(expected.marketType || "")
+    && normalizeTelegramText(stored.quoteSource || "") === normalizeTelegramText(expected.quoteSource || "")
+    && telegramPairRegimeOptionalNumbersEqual(stored.observedAt, expected.observedAt)
+    && telegramPairRegimeOptionalNumbersEqual(stored.decisionAt, expected.decisionAt)
+    && telegramPairRegimeOptionalNumbersEqual(stored.leftOdds, expected.leftOdds)
+    && telegramPairRegimeOptionalNumbersEqual(stored.rightOdds, expected.rightOdds);
+}
+
+function isTelegramPairRegimeFrozenMarketValid(market, pairRegime, decisionAt) {
+  if (!pairRegime || pairRegime.marketReady !== true) {
+    return !market;
+  }
+  if (!market || typeof market !== "object") {
+    return false;
+  }
+  const observedAt = Number(market.observedAt || 0);
+  const leftOdds = Number(market.leftOdds);
+  const rightOdds = Number(market.rightOdds);
+  return normalizeTelegramText(market.status || "").toLowerCase() === "ready"
+    && normalizeTelegramText(market.marketType || "").toLowerCase() === "matchresult"
+    && normalizeTelegramText(market.quoteSource || market.preferredSource || "").toLowerCase()
+      === "opening"
+    && market.retrospective !== true
+    && leftOdds > 1
+    && rightOdds > 1
+    && observedAt > 0
+    && observedAt <= Number(decisionAt || 0)
+    && telegramPairRegimeOptionalNumbersEqual(pairRegime.marketObservedAt, observedAt)
+    && telegramPairRegimeOptionalNumbersEqual(pairRegime.marketDecisionAt, Number(decisionAt || 0))
+    && telegramPairRegimeOptionalNumbersEqual(pairRegime.marketLeftOdds, leftOdds)
+    && telegramPairRegimeOptionalNumbersEqual(pairRegime.marketRightOdds, rightOdds);
+}
+
+function telegramPairRegimeMarketFeaturesMatch(
+  features,
+  detailsFeatures,
+  frozenMarket,
+  pairRegime,
+  decisionAt
+) {
+  const primary = features && typeof features === "object" ? features : {};
+  const fallback = detailsFeatures && typeof detailsFeatures === "object" ? detailsFeatures : {};
+  const readText = (key) => readTelegramPrematchFeatureText(primary[key], fallback[key]);
+  const readNumber = (key) => readTelegramPrematchFeatureNumber(primary[key], fallback[key]);
+  const storedSnapshot = primary.startMatchPairRegimeMarketSnapshot
+    || fallback.startMatchPairRegimeMarketSnapshot
+    || null;
+  const thresholds = globalThis.LvrVerifiedPairRegimeV1
+    && globalThis.LvrVerifiedPairRegimeV1.THRESHOLDS || {};
+  const salvageMinimum = Number(thresholds.marketSalvageFavoriteProbabilityMinimum);
+  const overrideMinimum = Number(thresholds.marketSideOverrideFavoriteProbabilityMinimum);
+  const expectedSalvage = Boolean(
+    pairRegime.marketReady
+    && pairRegime.marketFavoriteSideIndex === pairRegime.baseSelectedSideIndex
+    && Number(pairRegime.marketFavoriteProbability) >= salvageMinimum
+  );
+  const expectedOverride = Boolean(
+    pairRegime.marketReady
+    && (pairRegime.marketFavoriteSideIndex === 0 || pairRegime.marketFavoriteSideIndex === 1)
+    && pairRegime.marketFavoriteSideIndex !== pairRegime.baseSelectedSideIndex
+    && Number(pairRegime.marketFavoriteProbability) >= overrideMinimum
+  );
+  return readNumber("startMatchPairRegimeMarketReady") === (pairRegime.marketReady ? 1 : 0)
+    && readText("startMatchPairRegimeMarketReason") === pairRegime.marketReason
+    && readText("startMatchPairRegimeMarketType") === pairRegime.marketType
+    && readText("startMatchPairRegimeMarketQuoteSource") === pairRegime.marketQuoteSource
+    && telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketObservedAt"),
+      pairRegime.marketObservedAt
+    )
+    && telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketDecisionAt"),
+      pairRegime.marketDecisionAt
+    )
+    && telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketLeftOdds"),
+      pairRegime.marketLeftOdds
+    )
+    && telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketRightOdds"),
+      pairRegime.marketRightOdds
+    )
+    && telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketLeftImpliedProbability"),
+      pairRegime.marketLeftImpliedProbability
+    )
+    && telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketRightImpliedProbability"),
+      pairRegime.marketRightImpliedProbability
+    )
+    && telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketFavoriteSideIndex"),
+      pairRegime.marketFavoriteSideIndex
+    )
+    && telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeMarketFavoriteProbability"),
+      pairRegime.marketFavoriteProbability
+    )
+    && readNumber("startMatchPairRegimeMarketSideOverrideApplied")
+      === (pairRegime.marketSideOverrideApplied ? 1 : 0)
+    && readNumber("startMatchPairRegimeMarketSalvageAccepted")
+      === (pairRegime.marketSalvageAccepted ? 1 : 0)
+    && pairRegime.marketSalvageAccepted === expectedSalvage
+    && pairRegime.marketSideOverrideApplied === expectedOverride
+    && telegramPairRegimeMarketSnapshotsEqual(storedSnapshot, pairRegime.marketSnapshot)
+    && isTelegramPairRegimeFrozenMarketValid(frozenMarket, pairRegime, decisionAt);
 }
 
 function validateTelegramMatchStartStateContinuity(source) {
@@ -4479,6 +5174,27 @@ function sanitizeTelegramPredictionFeatures(features) {
     "startMatchSelectedSideIndex",
     "startMatchHistorySelectedSideIndex",
     "startMatchBaseSelectedSideIndex",
+    "startMatchZ0Score",
+    "startMatchZ0LeftP",
+    "startMatchZ0RightP",
+    "startMatchZ0LeftS3",
+    "startMatchZ0RightS3",
+    "startMatchZ0LeftL",
+    "startMatchZ0RightL",
+    "startMatchZ0LeftF3",
+    "startMatchZ0RightF3",
+    "startMatchLegacySelectedSideIndex",
+    "startMatchLegacyRawScoreDelta",
+    "startMatchSideGuardHistorySideIndex",
+    "startMatchSideGuardBaseSideIndex",
+    "startMatchSideGuardSelectedSideIndex",
+    "startMatchSideGuardSidesDisagree",
+    "startMatchSideGuardWindowSize",
+    "startMatchSideGuardQualifyingSettled",
+    "startMatchSideGuardPairSum",
+    "startMatchSideGuardStateCutoffAt",
+    "startMatchSideGuardStateThroughSettledAt",
+    "startMatchSideGuardStateSourceCount",
     "startMatchLivePointCorrectionApplied",
     "startMatchLivePointCorrectionThreshold",
     "startMatchLivePointCorrectionSelectedLead",
@@ -4488,6 +5204,7 @@ function sanitizeTelegramPredictionFeatures(features) {
     "startMatchRelativeAgreementScore",
     "startMatchLatestPbpReversal",
     "startMatchPairRegimeSelectedSideIndex",
+    "startMatchPairRegimeBaseSelectedSideIndex",
     "startMatchPairRegimePointWindowSize",
     "startMatchPairRegimeDataReady",
     "startMatchPairRegimeEligible",
@@ -4523,6 +5240,17 @@ function sanitizeTelegramPredictionFeatures(features) {
     "startMatchPairRegimeSelectedFreshAtOrAboveHistory8",
     "startMatchPairRegimeOpponentFreshAtOrAboveHistory8",
     "startMatchPairRegimeRelativeFormSetShareException",
+    "startMatchPairRegimeMarketReady",
+    "startMatchPairRegimeMarketObservedAt",
+    "startMatchPairRegimeMarketDecisionAt",
+    "startMatchPairRegimeMarketLeftOdds",
+    "startMatchPairRegimeMarketRightOdds",
+    "startMatchPairRegimeMarketLeftImpliedProbability",
+    "startMatchPairRegimeMarketRightImpliedProbability",
+    "startMatchPairRegimeMarketFavoriteSideIndex",
+    "startMatchPairRegimeMarketFavoriteProbability",
+    "startMatchPairRegimeMarketSideOverrideApplied",
+    "startMatchPairRegimeMarketSalvageAccepted",
     "startMatchProductionAccepted",
     "startMatchLeaguePublishAccepted",
     "startMatchEntryPointTotal",
@@ -4556,6 +5284,12 @@ function sanitizeTelegramPredictionFeatures(features) {
   for (const key of [
     "leagueName",
     "startMatchRuleId",
+    "startMatchSideGuardRuleId",
+    "startMatchSideGuardSelectedSource",
+    "startMatchSideGuardReason",
+    "startMatchSideGuardInputHash",
+    "startMatchSideGuardStateHash",
+    "startMatchSideGuardStateSource",
     "startMatchFormulaId",
     "startMatchInputHash",
     "startMatchDecisionInputHash",
@@ -4568,6 +5302,9 @@ function sanitizeTelegramPredictionFeatures(features) {
     "startMatchPairRegimeInputHash",
     "startMatchPairRegimeLeagueClass",
     "startMatchPairRegimeReason",
+    "startMatchPairRegimeMarketReason",
+    "startMatchPairRegimeMarketType",
+    "startMatchPairRegimeMarketQuoteSource",
     "startMatchSignalMode",
     "startMatchProductionGateId",
     "startMatchLeagueMode",
@@ -4582,6 +5319,21 @@ function sanitizeTelegramPredictionFeatures(features) {
   }
   if (source.startMatchProfiles && typeof source.startMatchProfiles === "object") {
     result.startMatchProfiles = compactCalibrationValue(source.startMatchProfiles, 7);
+  }
+  if (
+    source.startMatchPairRegimeMarketSnapshot
+    && typeof source.startMatchPairRegimeMarketSnapshot === "object"
+  ) {
+    result.startMatchPairRegimeMarketSnapshot = compactCalibrationValue(
+      source.startMatchPairRegimeMarketSnapshot,
+      3
+    );
+  }
+  if (Array.isArray(source.startMatchSideGuardPairOutcomes)) {
+    result.startMatchSideGuardPairOutcomes = source.startMatchSideGuardPairOutcomes
+      .map(Number)
+      .filter((item) => item === -1 || item === 0 || item === 1)
+      .slice(-3);
   }
   return result;
 }
@@ -5514,6 +6266,7 @@ function summarizeTelegramStatsRows(rows) {
     resultRows: 0,
     pendingForecastRows: 0,
     pointSnapshots: 0,
+    latestProductionDecision: null,
     sentProductionStart: buildTelegramStatsBucket()
   };
 
@@ -5550,6 +6303,19 @@ function summarizeTelegramStatsRows(rows) {
     }
     const prematchResultStatus = getTelegramStatsPrematchResultStatus(row, prematch);
     const sent = prematch.sent === true || prematch.sent === 1;
+    const decisionAt = getTelegramPrematchDecisionAt(prematch, row);
+    if (
+      decisionAt > 0
+      && (
+        !summary.latestProductionDecision
+        || decisionAt > Number(summary.latestProductionDecision.decisionAt || 0)
+      )
+    ) {
+      summary.latestProductionDecision = {
+        decisionAt,
+        sent
+      };
+    }
     if (sent) {
       summary.sentPrematchRows += 1;
       if (prematchResultStatus === "hit" || prematchResultStatus === "miss") {
@@ -5706,7 +6472,7 @@ function parseTelegramStartPairRegimeRow(row) {
   const storedGateId = readTelegramPrematchFeatureText(features.startMatchProductionGateId);
   if (
     storedProtocolId !== TELEGRAM_START_PAIR_REGIME_PROTOCOL_ID
-    && storedGateId !== TELEGRAM_START_PAIR_REGIME_PRODUCTION_GATE_ID
+    || storedGateId !== TELEGRAM_START_PAIR_REGIME_PRODUCTION_GATE_ID
   ) {
     return null;
   }
@@ -5755,8 +6521,6 @@ function parseTelegramStartPairRegimeRow(row) {
   if (
     !startApi
     || typeof startApi.evaluate !== "function"
-    || typeof startApi.applyLivePointDeficitCorrection !== "function"
-    || typeof startApi.fingerprintDecision !== "function"
     || !pairApi
     || typeof pairApi.evaluate !== "function"
     || !Array.isArray(profiles)
@@ -5766,26 +6530,21 @@ function parseTelegramStartPairRegimeRow(row) {
     return { ...base, reason: "pair-regime-profiles-missing" };
   }
   const evaluation = startApi.evaluate({ profiles, players });
-  const livePointCorrection = startApi.applyLivePointDeficitCorrection({
-    selectedSideIndex: evaluation.sideIndex,
-    deliveryEntryState: prematch.deliveryEntryState
-  });
-  const decisionInputHash = startApi.fingerprintDecision({
-    profiles,
-    selectedSideIndex: evaluation.sideIndex,
-    deliveryEntryState: prematch.deliveryEntryState
-  });
-  const expectedSide = livePointCorrection.finalSideIndex;
   const pairRegime = pairApi.evaluate({
     profiles,
     selectedSideIndex: evaluation.sideIndex,
     pointWindowSize: evaluation.pointWindowSize,
     relativeAgreementScore: evaluation.sideCorrection && evaluation.sideCorrection.agreementScore,
     latestPbpReversal: evaluation.sideCorrection && evaluation.sideCorrection.latestReversal,
-    leagueName
+    leagueName,
+    moneylineMarket: prematch.referenceMoneylineMarket || null,
+    decisionAt: base.decisionAt
   });
+  const decisionInputHash = pairRegime.inputHash;
+  const expectedSide = pairRegime.selectedSideIndex;
   base.eligible = pairRegime.dataReady === true;
-  base.pairAccepted = pairRegime.moderateAccepted === true;
+  base.pairAccepted = pairRegime.moderateAccepted === true
+    || pairRegime.marketSalvageAccepted === true;
   base.signalMode = pairRegime.signalMode;
   base.sumWithinLimit = pairRegime.sumWithinLimit === true;
   base.countsUnequal = pairRegime.countsUnequal === true;
@@ -5809,29 +6568,9 @@ function parseTelegramStartPairRegimeRow(row) {
     && readTelegramPrematchFeatureNumber(features.startMatchSelectedSideIndex) === expectedSide
     && readTelegramPrematchFeatureNumber(features.startMatchHistorySelectedSideIndex)
       === evaluation.sideIndex
+    && readTelegramPrematchFeatureNumber(features.startMatchBaseSelectedSideIndex)
+      === evaluation.sideIndex
     && areTelegramNamesSame(prematch.playerName, players[expectedSide] || "")
-    && readTelegramPrematchFeatureText(features.startMatchLivePointCorrectionRuleId)
-      === livePointCorrection.ruleId
-    && readTelegramPrematchFeatureNumber(features.startMatchLivePointCorrectionApplied)
-      === (livePointCorrection.applied ? 1 : 0)
-    && telegramPairRegimeOptionalNumbersEqual(
-      readTelegramPrematchFeatureNumber(features.startMatchLivePointCorrectionThreshold),
-      livePointCorrection.threshold
-    )
-    && telegramPairRegimeOptionalNumbersEqual(
-      readTelegramPrematchFeatureNumber(features.startMatchLivePointCorrectionSelectedLead),
-      livePointCorrection.selectedPointLead
-    )
-    && telegramPairRegimeOptionalNumbersEqual(
-      readTelegramPrematchFeatureNumber(features.startMatchLivePointCorrectionLeftPoints),
-      livePointCorrection.leftPoints
-    )
-    && telegramPairRegimeOptionalNumbersEqual(
-      readTelegramPrematchFeatureNumber(features.startMatchLivePointCorrectionRightPoints),
-      livePointCorrection.rightPoints
-    )
-    && readTelegramPrematchFeatureText(features.startMatchLivePointCorrectionReason)
-      === livePointCorrection.reason
     && readTelegramPrematchFeatureText(features.startMatchInputHash) === evaluation.inputHash
     && readTelegramPrematchFeatureText(features.startMatchDecisionInputHash)
       === decisionInputHash
@@ -5848,6 +6587,15 @@ function parseTelegramStartPairRegimeRow(row) {
       === pairRegime.reason
     && readTelegramPrematchFeatureNumber(features.startMatchPairRegimeSelectedSideIndex)
       === pairRegime.selectedSideIndex
+    && readTelegramPrematchFeatureNumber(features.startMatchPairRegimeBaseSelectedSideIndex)
+      === pairRegime.baseSelectedSideIndex
+    && telegramPairRegimeMarketFeaturesMatch(
+      features,
+      {},
+      prematch.referenceMoneylineMarket || null,
+      pairRegime,
+      base.decisionAt
+    )
     && readTelegramPrematchFeatureNumber(features.startMatchPairRegimePointWindowSize)
       === pairRegime.pointWindowSize
     && readTelegramPrematchFeatureNumber(features.startMatchPairRegimeDataReady)
@@ -5962,6 +6710,11 @@ function parseTelegramStartPairRegimeRow(row) {
       === (leagueMode === "production" && pairRegime.accepted ? 1 : 0)
     && readTelegramPrematchFeatureNumber(features.startMatchLeaguePublishAccepted)
       === (leagueMode === "production" && pairRegime.accepted ? 1 : 0)
+    && normalizeTelegramText(prematch.oddsMeaning || "").toLowerCase()
+      === "optional-prematch-market-consensus"
+    && readTelegramPrematchFeatureNumber(features.startMatchUsesOdds)
+      === (pairRegime.marketReady ? 1 : 0)
+    && readTelegramPrematchFeatureNumber(features.startMatchUsesCurrentScore) === 0
     && decisionAction === expectedAction
     && (!base.sent || expectedAction === "forecast")
   );
@@ -6169,13 +6922,20 @@ function getTelegramStatsResultStatus(row) {
 }
 
 function getTelegramPrematchDecisionAt(prematch, row = null) {
-  return Number(
-    prematch && prematch.readyAt
-    || prematch && prematch.deliveryObservedAt
-    || prematch && prematch.ts
-    || prematch && prematch.requestedAt
-    || row && row.createdAt
+  const explicit = Number(
+    prematch && prematch.finalDecisionAt
+    || prematch && prematch.audit && prematch.audit.decision
+      && prematch.audit.decision.finalDecisionAt
     || 0
+  );
+  if (explicit > 0) return explicit;
+  return Math.max(
+    Number(prematch && prematch.readyAt || 0),
+    Number(prematch && prematch.deliveryObservedAt || 0),
+    Number(prematch && prematch.deliveryEntryState && prematch.deliveryEntryState.capturedAt || 0),
+    Number(prematch && prematch.ts || 0),
+    Number(prematch && prematch.requestedAt || 0),
+    Number(row && row.createdAt || 0)
   );
 }
 
@@ -6215,7 +6975,7 @@ function formatTelegramStatsMessage(summary) {
     "📌 <b>Статистика прогнозов</b>",
     `Обновлено: ${escapeTelegramHtml(formatTelegramStatsTime(safe.updatedAt))}`,
     "",
-    ...formatTelegramSimpleProductionLines(production, productionPair)
+    ...formatTelegramSimpleProductionLines(production, productionPair, safe.latestProductionDecision)
   ];
   const ttCupLines = formatTelegramSimplePairLines(ttCupPair);
   if (ttCupLines.length) {
@@ -6224,7 +6984,7 @@ function formatTelegramStatsMessage(summary) {
   return lines.join("\n");
 }
 
-function formatTelegramSimpleProductionLines(bucket, pairSummary) {
+function formatTelegramSimpleProductionLines(bucket, pairSummary, latestDecision = null) {
   const safe = bucket && typeof bucket === "object" ? bucket : buildTelegramStatsBucket();
   const pair = pairSummary && typeof pairSummary === "object" ? pairSummary : {};
   const published = Math.max(0, Number(safe.bet || 0));
@@ -6237,11 +6997,18 @@ function formatTelegramSimpleProductionLines(bucket, pairSummary) {
   const wins = Math.max(0, Number(safe.wins || 0));
   const losses = Math.max(0, Number(safe.losses || 0));
   const pending = Math.max(0, published - settled);
+  const rejected = Math.max(0, total - published);
   const coveragePct = total
     ? roundTelegramStatsPct((published / total) * 100)
     : 0;
+  const latestAt = Number(latestDecision && latestDecision.decisionAt || 0);
+  const latestLine = latestAt > 0
+    ? `🕒 Последняя обработка: <b>${escapeTelegramHtml(formatTelegramStatsTime(latestAt))}</b> · ${latestDecision.sent ? "сигнал отправлен" : "матч отброшен"}`
+    : "🕒 Последняя обработка: <b>ещё не было</b>";
   return [
     "🏆 <b>Кубок Сетки + Чехия</b>",
+    `⚙️ Обработано: <b>${formatTelegramStatsMetric(total)}</b> · отправлено: <b>${formatTelegramStatsMetric(published)}</b> · отброшено: <b>${formatTelegramStatsMetric(rejected)}</b>`,
+    latestLine,
     `Сигналы: <b>${formatTelegramStatsMetric(published)}</b> из ${formatTelegramStatsMetric(total)} матчей (${formatTelegramStatsMetric(coveragePct)}%)`,
     `✅ Победы: <b>${formatTelegramStatsMetric(wins)}</b> · ❌ Поражения: <b>${formatTelegramStatsMetric(losses)}</b> · ⏳ Ожидают: <b>${formatTelegramStatsMetric(pending)}</b>`,
     `🎯 Проходимость: <b>${formatTelegramSimpleHitRate(wins, settled, safe.hitRatePct)}</b>`

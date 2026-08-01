@@ -33,6 +33,9 @@ let collectProgressTimer = 0;
 let collectProgressInFlight = false;
 let collectProgressSession = 0;
 let collectProgressBusy = false;
+let archiveDashboardTimer = 0;
+let archiveDashboardLoading = false;
+let archiveStorageListener = null;
 const EXTENSION_RELOAD_PREPARE_TIMEOUT_MS = 1500;
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -81,7 +84,36 @@ document.addEventListener("DOMContentLoaded", () => {
   renderDetails([]);
   loadTelegramSettings();
   loadArchiveDashboard();
+  archiveDashboardTimer = window.setInterval(() => {
+    refreshCollectorHeartbeat();
+  }, 5000);
+  archiveStorageListener = (changes, areaName) => {
+    if (areaName === "local" && changes && changes.telegramPredictionDataset) {
+      loadArchiveDashboard({ silent: true });
+    }
+  };
+  chrome.storage.onChanged.addListener(archiveStorageListener);
 });
+
+window.addEventListener("unload", () => {
+  if (archiveDashboardTimer) {
+    window.clearInterval(archiveDashboardTimer);
+  }
+  if (archiveStorageListener) {
+    chrome.storage.onChanged.removeListener(archiveStorageListener);
+  }
+});
+
+async function refreshCollectorHeartbeat() {
+  try {
+    const response = await sendRuntimeMessage({ type: "lvr:getScanStatus" });
+    updateArchiveItem("Сбор сейчас", formatCurrentCollectorStatus(
+      response && response.scanStatus || null
+    ));
+  } catch (_) {
+    updateArchiveItem("Сбор сейчас", "расширение не отвечает");
+  }
+}
 
 async function collectForecast() {
   forecastButton.disabled = true;
@@ -141,6 +173,7 @@ async function collectFromTab(tab, type) {
       files: [
         "src/shared/pipeline-policy.js",
         "src/shared/start-match-rule.js",
+        "src/shared/side-correction-guard.js",
         "src/shared/verified-pair-regime-v1.js",
         "src/content/bsportsfan-parser.js"
       ]
@@ -241,10 +274,17 @@ function setTelegramStatus(message) {
   }
 }
 
-async function loadArchiveDashboard() {
+async function loadArchiveDashboard(options = {}) {
+  if (archiveDashboardLoading) {
+    return;
+  }
+  archiveDashboardLoading = true;
+  const silent = options && options.silent === true;
   try {
-    setArchiveActionStatus("Обновляю...");
-    setArchiveBusy(true);
+    if (!silent) {
+      setArchiveActionStatus("Обновляю...");
+      setArchiveBusy(true);
+    }
     const [datasetResponse, pipelineStatus, scanResponse] = await Promise.all([
       sendRuntimeMessage({ type: "lvr:getTelegramPredictionDataset", includeSummary: true }),
       sendRuntimeMessage({ type: "lvr:getTelegramPipelineStatus" }),
@@ -253,7 +293,9 @@ async function loadArchiveDashboard() {
     const rows = Array.isArray(datasetResponse && datasetResponse.dataset) ? datasetResponse.dataset : [];
     const summary = datasetResponse && datasetResponse.summary || {};
     renderArchiveDashboard(rows, summary, pipelineStatus || {}, scanResponse && scanResponse.scanStatus || null);
-    setArchiveActionStatus("");
+    if (!silent) {
+      setArchiveActionStatus("");
+    }
   } catch (error) {
     if (archiveStatus) {
       archiveStatus.textContent = errorMessage(error);
@@ -262,9 +304,14 @@ async function loadArchiveDashboard() {
       ["Архив", "ошибка"],
       ["Причина", errorMessage(error)]
     ]);
-    setArchiveActionStatus("");
+    if (!silent) {
+      setArchiveActionStatus("");
+    }
   } finally {
-    setArchiveBusy(false);
+    archiveDashboardLoading = false;
+    if (!silent) {
+      setArchiveBusy(false);
+    }
   }
 }
 
@@ -272,14 +319,12 @@ function renderArchiveDashboard(rows, summary, pipelineStatus, scanStatus = null
   const list = Array.isArray(rows) ? rows : [];
   const bounds = getArchiveTimeBounds(list);
   const resultRows = Number(summary && summary.resultRows || list.filter(hasDatasetFinalResult).length || 0);
-  const pointSnapshots = Number(summary && summary.pointSnapshots || countPointSnapshots(list));
   const pairRegimeForward = summary && summary.pairRegimeForward || {};
-  const pairRegimeTtCupShadow = summary && summary.pairRegimeTtCupShadow || {};
   const acceptedPair = pairRegimeForward.accepted || {};
+  const rejectedPair = pairRegimeForward.rejected || {};
+  const processed = Math.max(0, Number(pairRegimeForward.validEligibleRows || 0));
+  const latestDecision = summary && summary.latestProductionDecision || null;
   const openingOddsRows = list.filter(hasArchivedOpeningOdds).length;
-  const statsMessages = Array.isArray(pipelineStatus && pipelineStatus.statsMessages) ? pipelineStatus.statsMessages : [];
-  const pinnedCount = statsMessages.filter((item) => item && item.pinned).length;
-
   if (archiveStatus) {
     archiveStatus.textContent = bounds.startedAt
       ? `пишется с ${formatDateTime(bounds.startedAt)} · обновлён ${formatDateTime(bounds.updatedAt)}`
@@ -288,42 +333,30 @@ function renderArchiveDashboard(rows, summary, pipelineStatus, scanStatus = null
 
   renderArchiveItems([
     ["Сбор сейчас", formatCurrentCollectorStatus(scanStatus)],
+    ["Последняя обработка", formatLatestDecision(latestDecision)],
+    ["Матчей обработано", processed],
+    ["Отправлено", Math.max(0, Number(acceptedPair.sent || 0))],
+    ["Отброшено", Math.max(0, Number(rejectedPair.selected || 0))],
+    ["Ждут итог", Math.max(0, Number(acceptedPair.pending || 0))],
     ["Игр в архиве", list.length],
     ["Стартовые кэфы", `${openingOddsRows}/${list.length}`],
-    ["Point snapshots", pointSnapshots],
     ["Всего итогов", resultRows],
-    ["Фильтр принял", Math.max(0, Number(acceptedPair.selected || 0))],
-    ["Отправлено", Math.max(0, Number(acceptedPair.sent || 0))],
-    ["Закрыто", Math.max(0, Number(acceptedPair.settled || 0))],
-    ["Ждут итог", Math.max(0, Number(acceptedPair.pending || 0))],
-    ["Активный режим", "История + PBP; разворот стороны при отставании на 4+ очка"],
-    ["Фильтр · статус", formatPairCohortStatus(pairRegimeForward)],
-    ["Все пригодные", formatPairCohortBucket(pairRegimeForward.baseline, pairRegimeForward.cohortSize)],
-    ["Боевой фильтр", formatPairCohortBucket(pairRegimeForward.accepted, pairRegimeForward.cohortSize)],
-    ["Отклонено", formatPairCohortBucket(pairRegimeForward.rejected, pairRegimeForward.cohortSize)],
-    ["Возврат · PBP Strength", formatPairCohortBucket(
-      pairRegimeForward.strongSelectedStrengthException,
-      pairRegimeForward.cohortSize
-    )],
-    ["Возврат · стабильность сетов", formatPairCohortBucket(
-      pairRegimeForward.selectedHistorySetShareException,
-      pairRegimeForward.cohortSize
-    )],
-    ["Возврат · форма + сеты", formatPairCohortBucket(
-      pairRegimeForward.relativeFormSetShareException,
-      pairRegimeForward.cohortSize
-    )],
-    ["Сумма срывов ≤ 4", formatPairCohortBucket(pairRegimeForward.sumWithinLimit, pairRegimeForward.cohortSize)],
-    ["Срывы различаются", formatPairCohortBucket(pairRegimeForward.countsUnequal, pairRegimeForward.cohortSize)],
-    ["TT Cup · расчёт без отправки", formatPairCohortBucket(
-      pairRegimeTtCupShadow.accepted,
-      pairRegimeTtCupShadow.cohortSize
-    )],
-    ["Сеть BSportsFan", formatBsportsfanNetworkStatus(pipelineStatus && pipelineStatus.bsportsfanNetwork)],
-    ["Последний прогноз", formatTelegramDeliveryStatus(pipelineStatus && pipelineStatus.lastAudit)],
-    ["TG refs", Number(pipelineStatus && pipelineStatus.messageRefCount || 0)],
-    ["Закрепы", `${pinnedCount}/${Number(pipelineStatus && pipelineStatus.statsMessageCount || 0)}`]
+    ["Связь с BSportsFan", formatBsportsfanNetworkStatus(pipelineStatus && pipelineStatus.bsportsfanNetwork)]
   ]);
+}
+
+function formatLatestDecision(decision) {
+  const decidedAt = Number(decision && decision.decisionAt || 0);
+  if (!(decidedAt > 0)) {
+    return "ещё не было";
+  }
+  return `${formatClockTime(decidedAt)} · ${decision.sent ? "отправлен" : "отброшен"}`;
+}
+
+function formatClockTime(value) {
+  const date = new Date(Number(value || 0));
+  const pad = (item) => String(item).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
 function hasArchivedOpeningOdds(row) {
@@ -337,6 +370,15 @@ function hasArchivedOpeningOdds(row) {
 
 function formatCurrentCollectorStatus(scanStatus) {
   const snapshot = scanStatus && scanStatus.bsportsfan || {};
+  const recovery = snapshot.sessionRecovery && typeof snapshot.sessionRecovery === "object"
+    ? snapshot.sessionRecovery
+    : null;
+  if (recovery && recovery.active) {
+    if (String(recovery.stage || "") === "manual-required") {
+      return "остановлено — откройте BSportsFan и восстановите сессию";
+    }
+    return "восстанавливаю сессию BSportsFan";
+  }
   if (
     String(scanStatus && scanStatus.source || "") === "bsportsfan-protection"
     || snapshot.challenge === true
@@ -352,6 +394,13 @@ function formatCurrentCollectorStatus(scanStatus) {
     return "ошибка страницы 404";
   }
   const visibleRows = Array.isArray(snapshot.matches) ? snapshot.matches.length : 0;
+  const lastSeenAt = Number(scanStatus && scanStatus.ts || snapshot.ts || 0);
+  const ageSeconds = lastSeenAt > 0
+    ? Math.max(0, Math.floor((Date.now() - lastSeenAt) / 1000))
+    : null;
+  if (ageSeconds !== null && ageSeconds > 30) {
+    return `нет обновлений ${ageSeconds} сек. — проверьте вкладку BSportsFan`;
+  }
   if (cipMonitor && cipMonitor.active) {
     const states = cipMonitor.forecastStates && typeof cipMonitor.forecastStates === "object"
       ? cipMonitor.forecastStates
@@ -359,9 +408,9 @@ function formatCurrentCollectorStatus(scanStatus) {
     const failures = Number(states.cooling || 0)
       + Number(states.terminal || 0)
       + Number(states.notReady || 0);
-    return `CIP видно ${Number(cipMonitor.visibleRows || visibleRows)} · ждут старта ${Number(cipMonitor.waitingRows || 0)} · проблемы сбора ${failures}`;
+    return `работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · ждут старта ${Number(cipMonitor.waitingRows || 0)} · ошибок ${failures}`;
   }
-  return snapshot.ts ? `CIP не активен · видно ${visibleRows}` : "нет данных";
+  return snapshot.ts ? `список матчей не открыт · видно ${visibleRows}` : "нет данных";
 }
 
 function formatBsportsfanNetworkStatus(network) {
@@ -381,11 +430,23 @@ function renderArchiveItems(items) {
     return;
   }
   archiveStats.innerHTML = (Array.isArray(items) ? items : []).map(([label, value]) => (
-    `<div class="archive__item">
+    `<div class="archive__item" data-archive-label="${escapeHtml(label)}">
       <div class="archive__label">${escapeHtml(label)}</div>
       <div class="archive__value">${escapeHtml(value)}</div>
     </div>`
   )).join("");
+}
+
+function updateArchiveItem(label, value) {
+  if (!archiveStats) {
+    return;
+  }
+  const item = Array.from(archiveStats.querySelectorAll(".archive__item"))
+    .find((node) => node.dataset.archiveLabel === label);
+  const output = item && item.querySelector(".archive__value");
+  if (output) {
+    output.textContent = String(value ?? "");
+  }
 }
 
 async function downloadArchiveDataset() {
@@ -762,6 +823,7 @@ async function sendTelegramTabAction(detail) {
       files: [
         "src/shared/pipeline-policy.js",
         "src/shared/start-match-rule.js",
+        "src/shared/side-correction-guard.js",
         "src/shared/verified-pair-regime-v1.js",
         "src/content/bsportsfan-parser.js"
       ]
@@ -895,17 +957,21 @@ function renderForecastPanel(forecast, archive) {
   forecastMeta.textContent = "Сила / стабильность / форма";
   const filterStatus = pair.dataReady !== true
     ? "не хватает данных"
-    : pair.moderateAccepted
+    : pair.accepted
       ? "пройден"
       : "не пройден";
+  const decisionSource = pair.marketSideOverrideApplied
+    ? "сильный фаворит по стартовым кэфам"
+    : pair.marketSalvageAccepted && !pair.moderateAccepted
+      ? "история подтверждена стартовыми кэфами"
+      : "история и PBP";
+  const marketStatus = pair.marketReady
+    ? `${formatOptionalNumber(pair.marketLeftOdds)} · ${formatOptionalNumber(pair.marketRightOdds)}`
+    : "нет — используется PBP";
   forecastFactors.innerHTML = [
     `<div class="forecast__factor"><span>Боевой фильтр</span><strong>${filterStatus}</strong></div>`,
-    `<div class="forecast__factor"><span>Срывы игроков</span><strong>${formatOptionalNumber(pair.leftCollapseCount)} · ${formatOptionalNumber(pair.rightCollapseCount)}</strong></div>`,
-    `<div class="forecast__factor"><span>Сумма срывов</span><strong>${formatOptionalNumber(pair.collapseSum)} / 4</strong></div>`,
-    `<div class="forecast__factor"><span>PBP Strength выбранного</span><strong>преимущество ${formatOptionalNumber(pair.selectedStrengthEdge)} / 15</strong></div>`,
-    `<div class="forecast__factor"><span>Последние 8 выбранного</span><strong>доля сетов ${formatOptionalNumber(pair.selectedHistorySetSharePct)}% / 61.5%</strong></div>`,
-    `<div class="forecast__factor"><span>Относительная форма</span><strong>${formatOptionalNumber(pair.selectedFreshForm3Score)} / ${formatOptionalNumber(pair.selectedHistory8PerformancePct)} · соперник ${formatOptionalNumber(pair.opponentFreshForm3Score)} / ${formatOptionalNumber(pair.opponentHistory8PerformancePct)}</strong></div>`,
-    `<div class="forecast__factor"><span>Сеты за 5 матчей</span><strong>преимущество выбранного ${formatOptionalNumber(pair.selectedHistory5SetShareEdge)} / 10</strong></div>`
+    `<div class="forecast__factor"><span>Решение</span><strong>${escapeHtml(decisionSource)}</strong></div>`,
+    `<div class="forecast__factor"><span>Стартовые кэфы</span><strong>${escapeHtml(marketStatus)}</strong></div>`
   ].join("");
 }
 
@@ -937,25 +1003,28 @@ function buildCurrentForecastView(archive) {
   }
 
   const leagueName = getArchiveLeagueName(archive && archive.league);
+  const decisionAt = Date.now();
+  const moneylineMarket = buildPopupOpeningMoneylineMarket(
+    archive && archive.targetOdds,
+    decisionAt
+  );
   const pair = pairRule.evaluate({
     profiles,
     selectedSideIndex: selection.sideIndex,
     pointWindowSize: selection.pointWindowSize,
     relativeAgreementScore: selection.sideCorrection && selection.sideCorrection.agreementScore,
     latestPbpReversal: selection.sideCorrection && selection.sideCorrection.latestReversal,
-    leagueName
+    leagueName,
+    moneylineMarket,
+    decisionAt
   });
-  const livePointCorrection = typeof selector.applyLivePointDeficitCorrection === "function"
-    ? selector.applyLivePointDeficitCorrection({
-        selectedSideIndex: selection.sideIndex,
-        deliveryEntryState: archive && archive.deliveryEntryState
-      })
-    : { finalSideIndex: selection.sideIndex, applied: false };
-  const finalSideIndex = livePointCorrection.finalSideIndex === 0
-    || livePointCorrection.finalSideIndex === 1
-    ? livePointCorrection.finalSideIndex
+  const finalSideIndex = pair.selectedSideIndex === 0
+    || pair.selectedSideIndex === 1
+    ? pair.selectedSideIndex
     : selection.sideIndex;
-  const formulaAccepted = pair && pair.moderateAccepted === true;
+  const formulaAccepted = pair && (
+    pair.moderateAccepted === true || pair.marketSalvageAccepted === true
+  );
   const productionAccepted = pair && pair.accepted === true;
   const shadowAccepted = formulaAccepted && pair && pair.shadowOnly === true;
   const player = players[finalSideIndex] && players[finalSideIndex].name || `#${finalSideIndex + 1}`;
@@ -986,8 +1055,33 @@ function buildCurrentForecastView(archive) {
     player,
     sideIndex: finalSideIndex,
     scores: selection.scores,
-    pair,
-    livePointCorrection
+    pair
+  };
+}
+
+function buildPopupOpeningMoneylineMarket(value, decisionAt) {
+  const source = value && typeof value === "object" ? value : {};
+  if (source.retrospective === true || Number(source.backfilledAt || 0) > 0) {
+    return null;
+  }
+  const opening = source.opening && typeof source.opening === "object"
+    ? source.opening
+    : null;
+  const leftOdds = Number(opening && opening.leftOdds);
+  const rightOdds = Number(opening && opening.rightOdds);
+  if (!(leftOdds > 1) || !(rightOdds > 1)) {
+    return null;
+  }
+  return {
+    status: "ready",
+    marketType: "matchResult",
+    quoteSource: "opening",
+    usage: "model-input",
+    modelInput: true,
+    retrospective: false,
+    leftOdds,
+    rightOdds,
+    observedAt: decisionAt
   };
 }
 
@@ -1220,6 +1314,7 @@ function formatTelegramDeliveryStatus(value) {
     "production-strength-exception-qualified": "возвращён по PBP Strength",
     "production-history-share-exception-qualified": "возвращён по стабильности сетов",
     "production-relative-form-exception-qualified": "возвращён по форме и сетам",
+    "production-market-consensus-salvage-qualified": "возвращён по подтверждению стартовыми кэфами",
     "production-combination-rejected": "боевой фильтр не пройден",
     "collapse-profiles-missing": "не хватает профилей игроков",
     "collapse-selected-side-missing": "не выбрана сторона прогноза",
@@ -1263,12 +1358,49 @@ function buildArchiveGamesCsv(rows) {
     "gateId",
     "selectorInputHash",
     "decisionInputHash",
+    "selectorFormulaId",
+    "z0Score",
+    "z0LeftP",
+    "z0RightP",
+    "z0LeftS3",
+    "z0RightS3",
+    "z0LeftL",
+    "z0RightL",
+    "z0LeftF3",
+    "z0RightF3",
+    "legacySelectedSideIndex",
+    "legacyRawScoreDelta",
     "signalMode",
     "pbpFilterAccepted",
     "pbpPointWindow",
+    "pairBaseSelectedSideIndex",
+    "marketReady",
+    "marketReason",
+    "marketFavoriteSideIndex",
+    "marketFavoriteProbability",
+    "marketSideOverrideApplied",
+    "marketSalvageAccepted",
     "baseSelectedSideIndex",
     "historySelectedSideIndex",
     "selectedSideIndex",
+    "sideGuardRuleId",
+    "sideGuardHistorySideIndex",
+    "sideGuardBaseSideIndex",
+    "sideGuardSelectedSideIndex",
+    "sideGuardSelectedSource",
+    "sideGuardSidesDisagree",
+    "sideGuardWindowSize",
+    "sideGuardQualifyingSettled",
+    "sideGuardPairOutcomes",
+    "sideGuardPairSum",
+    "sideGuardReason",
+    "sideGuardInputHash",
+    "sideGuardStateCutoffAt",
+    "sideGuardStateThroughSettledAt",
+    "sideGuardStateHash",
+    "sideGuardStateSource",
+    "sideGuardStateSourceCount",
+    "finalDecisionAt",
     "historySideCorrectionApplied",
     "historySideCorrectionReason",
     "relativeAgreementScore",
@@ -1354,15 +1486,66 @@ function buildArchiveGamesCsv(rows) {
       gateId,
       selectorInputHash: features.startMatchInputHash || "",
       decisionInputHash: features.startMatchDecisionInputHash || "",
+      selectorFormulaId: features.startMatchFormulaId || "",
+      z0Score: features.startMatchZ0Score ?? "",
+      z0LeftP: features.startMatchZ0LeftP ?? "",
+      z0RightP: features.startMatchZ0RightP ?? "",
+      z0LeftS3: features.startMatchZ0LeftS3 ?? "",
+      z0RightS3: features.startMatchZ0RightS3 ?? "",
+      z0LeftL: features.startMatchZ0LeftL ?? "",
+      z0RightL: features.startMatchZ0RightL ?? "",
+      z0LeftF3: features.startMatchZ0LeftF3 ?? "",
+      z0RightF3: features.startMatchZ0RightF3 ?? "",
+      legacySelectedSideIndex: features.startMatchLegacySelectedSideIndex ?? "",
+      legacyRawScoreDelta: features.startMatchLegacyRawScoreDelta ?? "",
       signalMode: features.startMatchSignalMode || prematch.signalMode || "",
       pbpFilterAccepted: isCurrentCollapseGate ? features.startMatchPairRegimeModerateAccepted ?? "" : "",
       pbpPointWindow: isCurrentCollapseGate ? features.startMatchPairRegimePointWindowSize ?? "" : "",
+      pairBaseSelectedSideIndex: isCurrentCollapseGate
+        ? features.startMatchPairRegimeBaseSelectedSideIndex ?? ""
+        : "",
+      marketReady: isCurrentCollapseGate ? features.startMatchPairRegimeMarketReady ?? "" : "",
+      marketReason: isCurrentCollapseGate ? features.startMatchPairRegimeMarketReason || "" : "",
+      marketFavoriteSideIndex: isCurrentCollapseGate
+        ? features.startMatchPairRegimeMarketFavoriteSideIndex ?? ""
+        : "",
+      marketFavoriteProbability: isCurrentCollapseGate
+        ? features.startMatchPairRegimeMarketFavoriteProbability ?? ""
+        : "",
+      marketSideOverrideApplied: isCurrentCollapseGate
+        ? features.startMatchPairRegimeMarketSideOverrideApplied ?? ""
+        : "",
+      marketSalvageAccepted: isCurrentCollapseGate
+        ? features.startMatchPairRegimeMarketSalvageAccepted ?? ""
+        : "",
       baseSelectedSideIndex: features.startMatchBaseSelectedSideIndex ?? "",
       historySelectedSideIndex: features.startMatchHistorySelectedSideIndex ?? "",
       selectedSideIndex: features.startMatchSelectedSideIndex
         ?? prematch.sideIndex
         ?? (row && row.sideIndex)
         ?? "",
+      sideGuardRuleId: features.startMatchSideGuardRuleId || "",
+      sideGuardHistorySideIndex: features.startMatchSideGuardHistorySideIndex ?? "",
+      sideGuardBaseSideIndex: features.startMatchSideGuardBaseSideIndex ?? "",
+      sideGuardSelectedSideIndex: features.startMatchSideGuardSelectedSideIndex ?? "",
+      sideGuardSelectedSource: features.startMatchSideGuardSelectedSource || "",
+      sideGuardSidesDisagree: features.startMatchSideGuardSidesDisagree ?? "",
+      sideGuardWindowSize: features.startMatchSideGuardWindowSize ?? "",
+      sideGuardQualifyingSettled: features.startMatchSideGuardQualifyingSettled ?? "",
+      sideGuardPairOutcomes: Array.isArray(features.startMatchSideGuardPairOutcomes)
+        ? JSON.stringify(features.startMatchSideGuardPairOutcomes)
+        : "",
+      sideGuardPairSum: features.startMatchSideGuardPairSum ?? "",
+      sideGuardReason: features.startMatchSideGuardReason || "",
+      sideGuardInputHash: features.startMatchSideGuardInputHash || "",
+      sideGuardStateCutoffAt: formatDateTime(features.startMatchSideGuardStateCutoffAt),
+      sideGuardStateThroughSettledAt: formatDateTime(
+        features.startMatchSideGuardStateThroughSettledAt
+      ),
+      sideGuardStateHash: features.startMatchSideGuardStateHash || "",
+      sideGuardStateSource: features.startMatchSideGuardStateSource || "",
+      sideGuardStateSourceCount: features.startMatchSideGuardStateSourceCount ?? "",
+      finalDecisionAt: formatDateTime(prematch.finalDecisionAt),
       historySideCorrectionApplied: features.startMatchSideCorrectionApplied ?? "",
       historySideCorrectionReason: features.startMatchSideCorrectionReason ?? "",
       relativeAgreementScore: features.startMatchRelativeAgreementScore ?? "",
@@ -1450,15 +1633,15 @@ function buildArchiveRuleRows(summary) {
   const pairRegime = summary && summary.pairRegimeForward || {};
   const pairRegimeTt = summary && summary.pairRegimeTtCupShadow || {};
   const pairRegimeRows = [
-    ["forward_pbp_filter_baseline", pairRegime, pairRegime.baseline, "all technically eligible Setka/Czech matches"],
-    ["forward_production_pbp_filter", pairRegime, pairRegime.accepted, "use the prematch relative side selector and moderate PBP filter; after acceptance, switch only when that history-selected side trails by at least four points in the first set; Setka/Czech Telegram ON"],
-    ["forward_rejected_pbp_filter", pairRegime, pairRegime.rejected, "reject only when the collapse rule and all three recovery branches fail"],
+    ["forward_model_baseline", pairRegime, pairRegime.baseline, "all technically eligible Setka/Czech matches"],
+    ["forward_production_model", pairRegime, pairRegime.accepted, "Z0/PBP with causal opening-market side override and market-backed recovery; Setka/Czech Telegram ON"],
+    ["forward_rejected_model", pairRegime, pairRegime.rejected, "rejected by both the PBP fallback and causal opening-market confirmation"],
     ["forward_collapse_sum_lte_4", pairRegime, pairRegime.sumWithinLimit, "collapse sum <= 4"],
     ["forward_collapse_counts_unequal", pairRegime, pairRegime.countsUnequal, "collapse counts unequal"],
     ["forward_strength_recovery", pairRegime, pairRegime.strongSelectedStrengthException, "recovered outside the collapse gate by selected raw PBP strength edge >= 15"],
     ["forward_history_share_recovery", pairRegime, pairRegime.selectedHistorySetShareException, "recovered outside earlier branches by selected eight-match set share >= 61.5%"],
     ["forward_relative_form_recovery", pairRegime, pairRegime.relativeFormSetShareException, "recovered outside earlier branches when both players are at or above their own eight-match performance and the selected player leads five-match set share by >= 10 points"],
-    ["forward_tt_cup_pbp_filter", pairRegimeTt, pairRegimeTt.accepted, "use the same prematch selector, moderate filter, and first-set deficit-four side correction; TT Cup calculate/save/statistics ON, Telegram OFF"]
+    ["forward_tt_cup_model", pairRegimeTt, pairRegimeTt.accepted, "use the same prematch model; TT Cup calculate/save/statistics ON, Telegram OFF"]
   ].filter(([, , bucket]) => bucket && typeof bucket === "object")
     .map(([scope, cohort, bucket, rule]) => ({
       scope,

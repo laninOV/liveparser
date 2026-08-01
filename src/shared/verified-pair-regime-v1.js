@@ -6,22 +6,21 @@
   if (!startRule || !startRule.FORMULA_ID) {
     throw new Error("LvrStartMatchRule must be loaded before LvrVerifiedPairRegimeV1");
   }
-
   const PROTOCOL = Object.freeze({
-    schemaVersion: 8,
-    id: "start-moderate-live-deficit4-v7-2026-07-31",
-    gateId: "moderate-filter-with-live-deficit4-v1",
+    schemaVersion: 12,
+    id: "start-z0-market-consensus-v12-2026-08-01",
+    gateId: "pbp-or-market-consensus-v2",
     selectorFormulaId: startRule.FORMULA_ID,
     target: "player-takes-two-or-more-sets",
-    registeredAt: "2026-07-31T00:00:00Z",
+    registeredAt: "2026-08-01T00:00:00Z",
     targetEligible: 300,
     minimumReviewSettled: 150,
     productionLeagues: Object.freeze(["setka", "czech"]),
     rules: Object.freeze({
       pointWindow: "same common selector window: 5, otherwise 3",
-      gate: "the existing PBP gate passes, then base-collapse agreement 2.5 is rejected; every remaining accepted signal belongs to one moderate production stream",
-      side: "relative four-factor selector with base-collapse correction; after the moderate gate, switch only if that history side trails by at least four points in the first set",
-      currentScore: "used only for the deterministic first-set deficit-four side switch; never used to reject a match"
+      gate: "the frozen moderate PBP gate is the base fallback; a rejected match is restored only when causal opening match-result odds agree with Z0 at normalized favorite probability 0.55 or higher",
+      side: "use frozen Z0 by default; causal opening match-result favorite replaces it only at normalized favorite probability 0.60 or higher",
+      currentScore: "not used for the gate or the final side; live state only confirms that the first set is still in progress"
     })
   });
 
@@ -33,7 +32,9 @@
     relativeFormHistoryMatches: 8,
     relativeSetShareMatches: 5,
     selectedFiveMatchSetShareEdgeMinimum: 10,
-    rejectedRelativeAgreementScore: 2.5
+    rejectedRelativeAgreementScore: 2.5,
+    marketSalvageFavoriteProbabilityMinimum: 0.55,
+    marketSideOverrideFavoriteProbabilityMinimum: 0.6
   });
 
   function finiteOrNull(value) {
@@ -111,11 +112,133 @@
     return Math.round(number * factor) / factor;
   }
 
+  function normalizeMarketToken(value) {
+    return String(value || "")
+      .replace(/\s+/g, "")
+      .replace(/[-_]/g, "")
+      .trim()
+      .toLowerCase();
+  }
+
+  function readCausalOpeningMarket(value, decisionAtValue) {
+    const source = value && typeof value === "object" ? value : {};
+    const decisionAt = finiteOrNull(decisionAtValue);
+    const observedAt = finiteOrNull(source.observedAt);
+    const leftOdds = finiteOrNull(source.leftOdds);
+    const rightOdds = finiteOrNull(source.rightOdds);
+    const marketTypeReady = normalizeMarketToken(source.marketType) === "matchresult";
+    const quoteSourceReady = normalizeMarketToken(source.quoteSource) === "opening";
+    const statusReady = normalizeMarketToken(source.status) === "ready";
+    const usageToken = normalizeMarketToken(source.usage);
+    const retrospective = source.modelInput === false
+      || source.retrospective === true
+      || source.backfilled === true
+      || source.backfill === true
+      || source.isBackfilled === true
+      || source.historicalBackfill === true
+      || finiteOrNull(source.backfilledAt) > 0
+      || Boolean(usageToken && usageToken !== "modelinput");
+    const oddsReady = leftOdds !== null && leftOdds > 1
+      && rightOdds !== null && rightOdds > 1;
+    const observationReady = observedAt !== null && observedAt > 0;
+    const decisionReady = decisionAt !== null && decisionAt > 0;
+    const causal = observationReady && decisionReady && observedAt <= decisionAt;
+    const marketReady = marketTypeReady
+      && quoteSourceReady
+      && statusReady
+      && !retrospective
+      && oddsReady
+      && causal;
+    const rawLeftProbability = marketReady ? 1 / leftOdds : null;
+    const rawRightProbability = marketReady ? 1 / rightOdds : null;
+    const probabilityTotal = marketReady ? rawLeftProbability + rawRightProbability : null;
+    const leftImpliedProbability = probabilityTotal > 0
+      ? rawLeftProbability / probabilityTotal
+      : null;
+    const rightImpliedProbability = probabilityTotal > 0
+      ? rawRightProbability / probabilityTotal
+      : null;
+    const tied = marketReady
+      && Math.abs(leftImpliedProbability - rightImpliedProbability) <= 1e-12;
+    const favoriteSideIndex = !marketReady || tied
+      ? null
+      : leftImpliedProbability > rightImpliedProbability ? 0 : 1;
+    const favoriteProbability = favoriteSideIndex === null
+      ? marketReady ? 0.5 : null
+      : favoriteSideIndex === 0 ? leftImpliedProbability : rightImpliedProbability;
+
+    let reason = "opening-market-ready";
+    if (!value || typeof value !== "object") reason = "opening-market-missing";
+    else if (!marketTypeReady) reason = "opening-market-type-invalid";
+    else if (!quoteSourceReady) reason = "opening-market-source-invalid";
+    else if (!statusReady) reason = "opening-market-status-invalid";
+    else if (retrospective) reason = "opening-market-retrospective-not-allowed";
+    else if (!oddsReady) reason = "opening-market-odds-invalid";
+    else if (!observationReady) reason = "opening-market-observed-at-invalid";
+    else if (!decisionReady) reason = "opening-market-decision-at-invalid";
+    else if (!causal) reason = "opening-market-observed-after-decision";
+    else if (tied) reason = "opening-market-tie";
+
+    const marketSnapshot = Object.freeze({
+      marketType: marketTypeReady ? "matchResult" : String(source.marketType || ""),
+      quoteSource: quoteSourceReady ? "opening" : String(source.quoteSource || ""),
+      status: marketReady ? "ready" : String(source.status || ""),
+      usage: marketReady ? "model-input" : String(source.usage || ""),
+      modelInput: marketReady || source.modelInput === true,
+      retrospective,
+      leftOdds: round(leftOdds),
+      rightOdds: round(rightOdds),
+      observedAt: round(observedAt, 3),
+      decisionAt: round(decisionAt, 3),
+      leftImpliedProbability: round(leftImpliedProbability, 9),
+      rightImpliedProbability: round(rightImpliedProbability, 9),
+      favoriteSideIndex,
+      favoriteProbability: round(favoriteProbability, 9),
+      marketReady,
+      reason
+    });
+    return {
+      marketReady,
+      reason,
+      marketType: marketSnapshot.marketType,
+      quoteSource: marketSnapshot.quoteSource,
+      observedAt,
+      decisionAt,
+      leftOdds,
+      rightOdds,
+      leftImpliedProbability,
+      rightImpliedProbability,
+      favoriteSideIndex,
+      favoriteProbability,
+      marketSnapshot
+    };
+  }
+
   function evaluate(input = {}) {
     const profiles = Array.isArray(input.profiles) ? input.profiles.slice(0, 2) : [];
-    const selectedSideIndex = input.selectedSideIndex === 0 || input.selectedSideIndex === 1
+    const baseSelectedSideIndex = input.selectedSideIndex === 0 || input.selectedSideIndex === 1
       ? input.selectedSideIndex
       : null;
+    const market = readCausalOpeningMarket(input.moneylineMarket, input.decisionAt);
+    const marketStrongFavorite = Boolean(
+      market.marketReady
+      && market.favoriteSideIndex !== null
+      && market.favoriteProbability >= THRESHOLDS.marketSideOverrideFavoriteProbabilityMinimum
+    );
+    const selectedSideIndex = marketStrongFavorite
+      ? market.favoriteSideIndex
+      : baseSelectedSideIndex;
+    const marketSideOverrideApplied = Boolean(
+      marketStrongFavorite
+      && baseSelectedSideIndex !== null
+      && market.favoriteSideIndex !== baseSelectedSideIndex
+    );
+    const marketSalvageAccepted = Boolean(
+      market.marketReady
+      && baseSelectedSideIndex !== null
+      && market.favoriteSideIndex === baseSelectedSideIndex
+      && market.favoriteProbability >= THRESHOLDS.marketSalvageFavoriteProbabilityMinimum
+    );
     const pointWindowSize = Number(input.pointWindowSize);
     const relativeAgreementScore = finiteOrNull(input.relativeAgreementScore);
     const latestPbpReversal = input.latestPbpReversal === true;
@@ -125,7 +248,7 @@
     const windowReady = pointWindowSize === 5 || pointWindowSize === 3;
     const metrics = profiles.map((profile) => readSideMetrics(profile, pointWindowSize));
     const metricsReady = profiles.length === 2
-      && selectedSideIndex !== null
+      && baseSelectedSideIndex !== null
       && windowReady
       && metrics.length === 2
       && metrics.every((side) => (
@@ -145,8 +268,8 @@
       ? Math.abs(leftCollapseCount - rightCollapseCount)
       : null;
     const historySignals = profiles.map(readHistorySignals);
-    const selectedHistory = selectedSideIndex === null ? null : historySignals[selectedSideIndex];
-    const opponentHistory = selectedSideIndex === null ? null : historySignals[1 - selectedSideIndex];
+    const selectedHistory = baseSelectedSideIndex === null ? null : historySignals[baseSelectedSideIndex];
+    const opponentHistory = baseSelectedSideIndex === null ? null : historySignals[1 - baseSelectedSideIndex];
     const selectedHistoryWindowReady = Boolean(
       selectedHistory
       && selectedHistory.eightMatchWindowMatches >= THRESHOLDS.historySetShareMatches
@@ -166,8 +289,8 @@
       && selectedHistory.eightMatchPerformancePct !== null
       && opponentHistory.eightMatchPerformancePct !== null
     );
-    const selectedMetrics = metricsReady ? metrics[selectedSideIndex] : null;
-    const opponentMetrics = metricsReady ? metrics[1 - selectedSideIndex] : null;
+    const selectedMetrics = metricsReady ? metrics[baseSelectedSideIndex] : null;
+    const opponentMetrics = metricsReady ? metrics[1 - baseSelectedSideIndex] : null;
     const selectedStrengthScore = selectedMetrics ? selectedMetrics.strengthScore : null;
     const opponentStrengthScore = opponentMetrics ? opponentMetrics.strengthScore : null;
     const selectedStrengthEdge = metricsReady
@@ -217,14 +340,19 @@
       && relativeAgreementScore === THRESHOLDS.rejectedRelativeAgreementScore
     );
     const moderateAccepted = formulaAccepted && !rejectedByModerateTier;
-    const signalMode = moderateAccepted ? "moderate" : "rejected";
+    const signalMode = moderateAccepted
+      ? "moderate"
+      : marketSalvageAccepted
+        ? "market-consensus"
+        : "rejected";
     const dataReady = metricsReady;
     const eligible = dataReady && productionLeague;
-    const accepted = eligible && moderateAccepted;
+    const accepted = eligible && (moderateAccepted || marketSalvageAccepted);
     const inputHash = dataReady
       ? hashPayload({
           protocolId: PROTOCOL.id,
           selectorFormulaId: PROTOCOL.selectorFormulaId,
+          baseSelectedSideIndex,
           selectedSideIndex,
           relativeAgreementScore,
           latestPbpReversal,
@@ -232,17 +360,21 @@
           leagueClass,
           left,
           right,
-          historySignals
+          historySignals,
+          marketSnapshot: market.marketSnapshot,
+          marketSideOverrideApplied,
+          marketSalvageAccepted
         })
       : "";
 
     let reason = "collapse-combination-rejected";
     if (profiles.length !== 2) reason = "collapse-profiles-missing";
-    else if (selectedSideIndex === null) reason = "collapse-selected-side-missing";
+    else if (baseSelectedSideIndex === null) reason = "collapse-selected-side-missing";
     else if (!windowReady) reason = "collapse-common-window-missing";
     else if (!metricsReady) reason = "collapse-metrics-missing";
     else if (leagueClass === "blocked") reason = "collapse-league-blocked";
     else if (shadowOnly) reason = "tt-cup-shadow-only";
+    else if (accepted && !moderateAccepted && marketSalvageAccepted) reason = "production-market-consensus-salvage-qualified";
     else if (formulaAccepted && rejectedByModerateTier) reason = "production-relative-agreement-rejected";
     else if (accepted && collapseAccepted) reason = "production-collapse-qualified";
     else if (accepted && strongSelectedStrengthException) reason = "production-strength-exception-qualified";
@@ -256,6 +388,7 @@
       gateId: PROTOCOL.gateId,
       selectorFormulaId: PROTOCOL.selectorFormulaId,
       target: PROTOCOL.target,
+      baseSelectedSideIndex,
       selectedSideIndex,
       pointWindowSize: windowReady ? pointWindowSize : null,
       leagueClass,
@@ -269,6 +402,21 @@
       signalMode,
       accepted,
       reason,
+      marketReady: market.marketReady,
+      marketReason: market.reason,
+      marketType: market.marketType,
+      marketQuoteSource: market.quoteSource,
+      marketObservedAt: round(market.observedAt, 3),
+      marketDecisionAt: round(market.decisionAt, 3),
+      marketLeftOdds: round(market.leftOdds),
+      marketRightOdds: round(market.rightOdds),
+      marketLeftImpliedProbability: round(market.leftImpliedProbability, 9),
+      marketRightImpliedProbability: round(market.rightImpliedProbability, 9),
+      marketFavoriteSideIndex: market.favoriteSideIndex,
+      marketFavoriteProbability: round(market.favoriteProbability, 9),
+      marketSideOverrideApplied,
+      marketSalvageAccepted,
+      marketSnapshot: market.marketSnapshot,
       leftCollapseCount: round(leftCollapseCount),
       rightCollapseCount: round(rightCollapseCount),
       collapseSum: round(collapseSum),
@@ -302,7 +450,7 @@
       latestPbpReversal,
       inputHash,
       thresholds: THRESHOLDS,
-      usesOdds: false,
+      usesOdds: market.marketReady,
       usesCurrentMatchScore: false
     };
   }

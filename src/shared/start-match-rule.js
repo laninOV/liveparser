@@ -1,13 +1,19 @@
 (function installLvrStartMatchRule(root) {
   "use strict";
 
-  const RULE_ID = "match-start-history-pbp-live-deficit4-v3";
-  const FORMULA_ID = "start-relative-side-correction-v2-2026-07-31";
+  const RULE_ID = "match-start-z0-market-v2";
+  const FORMULA_ID = "z0-side-selector-no-league-v1-2026-07-31";
   const MODEL_TARGET = "player-takes-two-or-more-sets";
   const MAX_HISTORY_MATCHES = 8;
-  const MIN_HISTORY_MATCHES = 5;
+  const MIN_HISTORY_MATCHES = 3;
   const PREFERRED_POINT_MATCHES = 5;
   const MIN_POINT_MATCHES = 3;
+
+  const Z0_WEIGHTS = Object.freeze({
+    latestStrengthScore: 8,
+    history3SetSharePct: 1,
+    latestOwnSets: 24
+  });
 
   const MODEL_COEFFICIENTS = Object.freeze({
     tookTwoLast5: 0.1002743765830373,
@@ -21,10 +27,6 @@
     collapseSumMaximum: 4,
     weakAgreementScores: Object.freeze([2, 2.5]),
     latestReversalAgreementMinimum: 3.5
-  });
-  const LIVE_POINT_CORRECTION = Object.freeze({
-    ruleId: "first-set-deficit-four-side-correction-v1",
-    maximumSelectedPointLead: -4
   });
 
   function finite(value) {
@@ -123,6 +125,34 @@
       + MODEL_COEFFICIENTS.closeLeadLostPct * inputs.closeLeadLostPct;
   }
 
+  function buildZ0Inputs(profile) {
+    const history = profile && profile.history;
+    const history3 = completeWindow(profile, "history", 3);
+    const latestPoint = profile && profile.point && profile.point.latest;
+    const inputs = {
+      latestStrengthScore: finite(latestPoint && latestPoint.strengthScore),
+      history3SetSharePct: finite(history3 && history3.setSharePct),
+      latestOwnSets: finite(history && history.latestOwnSets),
+      freshForm3Score: finite(history && history.freshForm3Score)
+    };
+    return {
+      ...inputs,
+      ready: [
+        inputs.latestStrengthScore,
+        inputs.history3SetSharePct,
+        inputs.latestOwnSets,
+        inputs.freshForm3Score
+      ].every((value) => value !== null)
+    };
+  }
+
+  function z0IndividualScore(inputs) {
+    if (!inputs || !inputs.ready) return null;
+    return Z0_WEIGHTS.latestStrengthScore * inputs.latestStrengthScore
+      + Z0_WEIGHTS.history3SetSharePct * inputs.history3SetSharePct
+      + Z0_WEIGHTS.latestOwnSets * inputs.latestOwnSets;
+  }
+
   function compareRelative(selectedValue, opponentValue, lowerIsBetter = false) {
     const selected = finite(selectedValue);
     const opponent = finite(opponentValue);
@@ -190,87 +220,23 @@
       && opponentMargin > selectedMargin;
   }
 
-  function correctSelectedSide(profiles, scores, pointWindowSize, baseSideIndex) {
+  function auditSelectedSide(profiles, scores, pointWindowSize, selectedSideIndex) {
     const baseCollapseBranch = isBaseCollapseBranch(profiles, pointWindowSize);
-    const selectedInputs = baseSideIndex === 0 || baseSideIndex === 1
-      ? scores[baseSideIndex] && scores[baseSideIndex].modelInputs
+    const selectedInputs = selectedSideIndex === 0 || selectedSideIndex === 1
+      ? scores[selectedSideIndex] && scores[selectedSideIndex].modelInputs
       : null;
-    const opponentInputs = baseSideIndex === 0 || baseSideIndex === 1
-      ? scores[1 - baseSideIndex] && scores[1 - baseSideIndex].modelInputs
+    const opponentInputs = selectedSideIndex === 0 || selectedSideIndex === 1
+      ? scores[1 - selectedSideIndex] && scores[1 - selectedSideIndex].modelInputs
       : null;
     const agreementScore = relativeAgreementScore(selectedInputs, opponentInputs);
-    const latestReversal = latestPbpReversal(profiles, baseSideIndex);
-    const weakAgreement = SIDE_CORRECTION.weakAgreementScores.includes(agreementScore);
-    const strongAgreementWithLatestReversal = agreementScore !== null
-      && agreementScore >= SIDE_CORRECTION.latestReversalAgreementMinimum
-      && latestReversal;
-    const applied = Boolean(
-      baseCollapseBranch
-      && (baseSideIndex === 0 || baseSideIndex === 1)
-      && (weakAgreement || strongAgreementWithLatestReversal)
-    );
+    const latestReversal = latestPbpReversal(profiles, selectedSideIndex);
     return {
-      sideIndex: applied ? 1 - baseSideIndex : baseSideIndex,
-      applied,
-      reason: !baseCollapseBranch
-        ? "outside-base-collapse-branch"
-        : weakAgreement
-          ? "weak-relative-agreement"
-          : strongAgreementWithLatestReversal
-            ? "latest-pbp-reversal"
-            : "base-side-kept",
+      sideIndex: selectedSideIndex,
+      applied: false,
+      reason: "z0-selector-frozen",
       baseCollapseBranch,
       agreementScore,
       latestReversal
-    };
-  }
-
-  function applyLivePointDeficitCorrection(input = {}) {
-    const historySideIndex = input.selectedSideIndex === 0 || input.selectedSideIndex === 1
-      ? input.selectedSideIndex
-      : null;
-    const state = input.deliveryEntryState && typeof input.deliveryEntryState === "object"
-      ? input.deliveryEntryState
-      : {};
-    const completedSets = finite(state.completedSets);
-    const targetSetNumber = finite(state.targetSetNumber);
-    const leftPoints = finite(state.currentPointLeftPoints);
-    const rightPoints = finite(state.currentPointRightPoints);
-    const firstSetLive = historySideIndex !== null
-      && String(state.mode || "").trim().toLowerCase() === "live"
-      && state.started === true
-      && state.finished !== true
-      && completedSets === 0
-      && targetSetNumber === 1;
-    const pointsReady = leftPoints !== null
-      && rightPoints !== null
-      && leftPoints >= 0
-      && rightPoints >= 0;
-    const selectedPointLead = firstSetLive && pointsReady
-      ? historySideIndex === 0
-        ? leftPoints - rightPoints
-        : rightPoints - leftPoints
-      : null;
-    const applied = selectedPointLead !== null
-      && selectedPointLead <= LIVE_POINT_CORRECTION.maximumSelectedPointLead;
-    return {
-      ruleId: LIVE_POINT_CORRECTION.ruleId,
-      threshold: LIVE_POINT_CORRECTION.maximumSelectedPointLead,
-      historySideIndex,
-      finalSideIndex: applied && historySideIndex !== null
-        ? 1 - historySideIndex
-        : historySideIndex,
-      applied,
-      reason: !firstSetLive
-        ? "first-set-live-state-missing"
-        : !pointsReady
-          ? "first-set-points-missing"
-          : applied
-            ? "history-side-trails-by-four-or-more"
-            : "history-side-kept",
-      selectedPointLead,
-      leftPoints,
-      rightPoints
     };
   }
 
@@ -322,11 +288,11 @@
     const pointMatches = finite(profile && profile.point && profile.point.matches) || 0;
     const modelInputs = buildModelInputs(profile, pointWindowSize);
     const rawScore = rawModelScore(modelInputs);
+    const selectorInputs = buildZ0Inputs(profile);
+    const selectorScore = z0IndividualScore(selectorInputs);
     const components = buildDisplayComponents(profile, modelInputs);
     return {
-      complete: historyMatches >= MIN_HISTORY_MATCHES
-        && pointMatches >= MIN_POINT_MATCHES
-        && modelInputs.ready,
+      complete: selectorInputs.ready,
       historyMatches,
       pointMatches,
       pointWindowSize: pointWindowSize || null,
@@ -337,6 +303,8 @@
           : "none",
       modelInputs,
       rawModelScore: rawScore === null ? null : round(rawScore, 6),
+      selectorInputs,
+      selectorScore: selectorScore === null ? null : round(selectorScore, 6),
       ...components
     };
   }
@@ -372,29 +340,6 @@
     });
   }
 
-  function fingerprintDecision(input = {}) {
-    const profiles = Array.isArray(input.profiles) ? input.profiles.slice(0, 2) : [];
-    const livePointCorrection = applyLivePointDeficitCorrection({
-      selectedSideIndex: input.selectedSideIndex,
-      deliveryEntryState: input.deliveryEntryState
-    });
-    return hashPayload({
-      ruleId: RULE_ID,
-      selectorFormulaId: FORMULA_ID,
-      selectorInputHash: fingerprint(profiles),
-      livePointCorrection: {
-        ruleId: livePointCorrection.ruleId,
-        threshold: livePointCorrection.threshold,
-        historySideIndex: livePointCorrection.historySideIndex,
-        finalSideIndex: livePointCorrection.finalSideIndex,
-        applied: livePointCorrection.applied,
-        selectedPointLead: livePointCorrection.selectedPointLead,
-        leftPoints: livePointCorrection.leftPoints,
-        rightPoints: livePointCorrection.rightPoints
-      }
-    });
-  }
-
   function evaluate(input = {}) {
     const profiles = Array.isArray(input.profiles) ? input.profiles.slice(0, 2) : [];
     const players = Array.isArray(input.players) ? input.players.slice(0, 2).map(String) : [];
@@ -405,22 +350,29 @@
     const pointWindowSize = profiles.length === 2 ? selectPointWindowSize(profiles) : null;
     const scores = profiles.map((profile) => scoreProfile(profile, pointWindowSize));
     const profilesReady = scores.length === 2 && scores.every((score) => score.complete);
-    const rawDelta = profilesReady
+    const legacyRawDelta = scores.length === 2
+      && scores.every((score) => score.rawModelScore !== null)
       ? scores[0].rawModelScore - scores[1].rawModelScore
       : null;
-    const baseSideIndex = rawDelta !== null && Math.abs(rawDelta) > 1e-9
-      ? rawDelta > 0 ? 0 : 1
+    const legacySideIndex = legacyRawDelta !== null && Math.abs(legacyRawDelta) > 1e-9
+      ? legacyRawDelta > 0 ? 0 : 1
       : null;
-    const sideCorrection = correctSelectedSide(
+    const z0Score = profilesReady
+      ? scores[0].selectorScore - scores[1].selectorScore
+      : null;
+    const sideIndex = z0Score === null ? null : z0Score >= 0 ? 0 : 1;
+    // Keep the historical guard contract as a no-op so existing audit and
+    // delivery validation stay deterministic while Z0 remains frozen.
+    const baseSideIndex = sideIndex;
+    const sideCorrection = auditSelectedSide(
       profiles,
       scores,
       pointWindowSize,
       baseSideIndex
     );
-    const sideIndex = sideCorrection.sideIndex;
-    const comparisonIndexLeft = rawDelta === null
+    const comparisonIndexLeft = z0Score === null
       ? null
-      : 100 / (1 + Math.exp(-Math.max(-20, Math.min(20, rawDelta))));
+      : 100 / (1 + Math.exp(-Math.max(-20, Math.min(20, z0Score / 100))));
     if (comparisonIndexLeft !== null && scores.length === 2) {
       scores[0].overall = round(comparisonIndexLeft);
       scores[1].overall = round(100 - comparisonIndexLeft);
@@ -428,7 +380,7 @@
 
     const eligible = identitiesReady && profilesReady && sideIndex !== null;
     return {
-      schemaVersion: 2,
+      schemaVersion: 3,
       ruleId: RULE_ID,
       formulaId: FORMULA_ID,
       modelTarget: MODEL_TARGET,
@@ -439,15 +391,17 @@
           ? "start-profile-incomplete"
           : sideIndex === null
             ? "start-profile-tie"
-            : sideCorrection.applied
-              ? "start-relative-side-correction-qualified"
-              : "start-history-pbp-qualified",
+            : "start-z0-qualified",
       sideIndex,
       baseSideIndex,
+      legacySideIndex,
       sideCorrection,
       playerName: sideIndex === null ? "" : players[sideIndex] || "",
       scores,
-      rawScoreDelta: rawDelta === null ? null : round(rawDelta, 6),
+      rawScoreDelta: z0Score === null ? null : round(z0Score, 6),
+      z0Score: z0Score === null ? null : round(z0Score, 6),
+      z0Inputs: scores.map((score) => score.selectorInputs),
+      legacyRawScoreDelta: legacyRawDelta === null ? null : round(legacyRawDelta, 6),
       scoreEdge: comparisonIndexLeft === null
         ? null
         : round(Math.abs(2 * comparisonIndexLeft - 100)),
@@ -462,11 +416,13 @@
         maximumHistoryMatches: MAX_HISTORY_MATCHES,
         minimumHistoryMatches: MIN_HISTORY_MATCHES,
         preferredPointMatches: PREFERRED_POINT_MATCHES,
-        minimumPointMatches: MIN_POINT_MATCHES
+        minimumPointMatches: MIN_POINT_MATCHES,
+        requiredSelectorInputs: ["P", "S3", "L", "F3"]
       },
       weights: {
         diagnosticWindows: WINDOW_WEIGHTS,
-        model: MODEL_COEFFICIENTS
+        selector: Z0_WEIGHTS,
+        diagnosticModel: MODEL_COEFFICIENTS
       },
       usesOdds: false,
       usesCurrentMatchScore: false
@@ -481,15 +437,13 @@
     MIN_HISTORY_MATCHES,
     PREFERRED_POINT_MATCHES,
     MIN_POINT_MATCHES,
+    Z0_WEIGHTS,
     MODEL_COEFFICIENTS,
     WINDOW_WEIGHTS,
     SIDE_CORRECTION,
-    LIVE_POINT_CORRECTION,
     evaluate,
-    applyLivePointDeficitCorrection,
     scoreProfile,
-    fingerprint,
-    fingerprintDecision
+    fingerprint
   });
 
   root.LvrStartMatchRule = api;

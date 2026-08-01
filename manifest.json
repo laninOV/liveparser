@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Прогноз настольного тенниса",
-  "description": "Прогнозирует 2+ сета: единый умеренный режим с восстановлением стартовых коэффициентов.",
-  "version": "0.30.30",
+  "description": "Прогнозирует 2+ сета: история и PBP с причинной проверкой прематч-рынком.",
+  "version": "0.31.1",
   "action": {
     "default_title": "Прогноз настольного тенниса",
     "default_popup": "src/popup/popup.html"
@@ -11,6 +11,7 @@
     "service_worker": "src/background/service-worker.js"
   },
   "permissions": [
+    "alarms",
     "scripting",
     "storage",
     "unlimitedStorage"
@@ -27,6 +28,7 @@
       "js": [
         "src/shared/pipeline-policy.js",
         "src/shared/start-match-rule.js",
+        "src/shared/side-correction-guard.js",
         "src/shared/verified-pair-regime-v1.js",
         "src/content/bsportsfan-parser.js"
       ],

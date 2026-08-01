@@ -1,0 +1,3 @@
+exports/**/*.csv -text -diff
+exports/**/*.json -text -diff
+exports/**/*.zip binary

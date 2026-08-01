@@ -45,6 +45,9 @@
   const MATCH_START_RULE_ID = String(
     globalThis.LvrStartMatchRule && globalThis.LvrStartMatchRule.RULE_ID || ""
   );
+  const MATCH_START_SIDE_GUARD_RULE_ID = String(
+    globalThis.LvrSideCorrectionGuard && globalThis.LvrSideCorrectionGuard.RULE_ID || ""
+  );
   const MATCH_START_PAIR_PROTOCOL = globalThis.LvrVerifiedPairRegimeV1
     && globalThis.LvrVerifiedPairRegimeV1.PROTOCOL || {};
   const MATCH_START_PAIR_GATE_ID = String(MATCH_START_PAIR_PROTOCOL.gateId || "");
@@ -74,11 +77,13 @@
   const RUNTIME_DELIVERY_TIMEOUT_MS = 22 * 1000;
   const BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS = 15 * 1000;
   const BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS = 10 * 60 * 1000;
-  const LIVE_SESSION_RECOVERY_STORAGE_KEY = "__lvrBsportsfanLiveSessionRecoveryV1";
+  const BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS = 6 * 60 * 60 * 1000;
+  const LIVE_SESSION_RECOVERY_STORAGE_KEY = "__lvrBsportsfanLiveSessionRecoveryV2";
+  const LEGACY_LIVE_SESSION_RECOVERY_STORAGE_KEY = "__lvrBsportsfanLiveSessionRecoveryV1";
   const LIVE_SESSION_RECOVERY_CHECK_INTERVAL_MS = 2000;
   const LIVE_SESSION_RECOVERY_HEALTHY_RESET_MS = 60 * 1000;
-  const LIVE_SESSION_RECOVERY_ATTEMPT_WINDOW_MS = 10 * 60 * 1000;
-  const LIVE_SESSION_RECOVERY_MAX_ATTEMPTS = 4;
+  const LIVE_SESSION_RECOVERY_ATTEMPT_WINDOW_MS = 30 * 60 * 1000;
+  const LIVE_SESSION_RECOVERY_MAX_ATTEMPTS = 2;
   const PREMATCH_POINT_FETCH_TIMEOUT_MS = 22 * 1000;
   const PREMATCH_POINT_ENRICH_MIN_REMAINING_MS = 6500;
   const MATCH_START_ARCHIVE_MAX_AGE_MS = 5 * 60 * 1000;
@@ -264,12 +269,29 @@
       detectedAt: recovery.detectedAt,
       attempt: recovery.attempt,
       delayMs: recovery.delayMs,
-      reloadAt: recovery.detectedAt + recovery.delayMs,
+      reloadAt: recovery.exhausted ? 0 : recovery.detectedAt + recovery.delayMs,
       reason: recovery.exhausted
         ? "live-session-recovery-limit"
         : normalizeText(reason || "live-session-expired")
     };
-    reportLiveSessionRecoveryStatus("reconnecting", recovery);
+    if (recovery.exhausted) {
+      sendRuntimeMessage({
+        type: "lvr:reportBsportsfanProtection",
+        reason: "live-session-manual-recovery-required",
+        code: "bsportsfan-session-expired",
+        retryAfterMs: BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS,
+        observedAt: recovery.detectedAt,
+        url: normalizeUrl(location.href)
+      }).catch(() => {});
+      reportLiveSessionRecoveryStatus("manual-required", recovery);
+      notifyBsportsfanAttention("session-expired");
+      return true;
+    }
+
+    reportLiveSessionRecoveryStatus(
+      recovery.attempt === 1 ? "reconnecting" : "reloading",
+      recovery
+    );
 
     liveSessionRecoveryTimer = window.setTimeout(() => {
       liveSessionRecoveryTimer = 0;
@@ -310,18 +332,29 @@
   function registerLiveSessionRecoveryAttempt() {
     const now = Date.now();
     const previous = readLiveSessionRecoveryHistory();
+    if (previous.manualRequired === true) {
+      return {
+        detectedAt: now,
+        attempt: Math.max(
+          LIVE_SESSION_RECOVERY_MAX_ATTEMPTS + 1,
+          Number(previous.attempt || 0) || 0
+        ),
+        delayMs: 0,
+        exhausted: true
+      };
+    }
     const attempts = (Array.isArray(previous.attempts) ? previous.attempts : [])
       .map(Number)
       .filter((value) => Number.isFinite(value) && now - value <= LIVE_SESSION_RECOVERY_ATTEMPT_WINDOW_MS);
     attempts.push(now);
     const attempt = attempts.length;
-    const delays = [300, 2500, 8000, 20000, 60000];
+    const delays = [500, 5000];
     const exhausted = attempt > LIVE_SESSION_RECOVERY_MAX_ATTEMPTS;
-    const delayMs = exhausted
-      ? 2 * 60 * 1000
-      : delays[Math.min(delays.length - 1, attempt - 1)];
+    const delayMs = exhausted ? 0 : delays[Math.min(delays.length - 1, attempt - 1)];
     writeLiveSessionRecoveryHistory({
       attempts,
+      attempt,
+      manualRequired: exhausted,
       lastDetectedAt: now,
       lastUrl: normalizeUrl(location.href)
     });
@@ -335,6 +368,22 @@
 
   function performLiveSessionRecovery(toast, recovery) {
     reportLiveSessionRecoveryStatus("reloading", recovery);
+    if (Number(recovery && recovery.attempt || 0) >= 2) {
+      let hardReloadTriggered = false;
+      const triggerHardReload = () => {
+        if (hardReloadTriggered) return;
+        hardReloadTriggered = true;
+        window.location.reload();
+      };
+      const preparationTimeout = window.setTimeout(triggerHardReload, 1200);
+      Promise.resolve(liveSessionRecoveryPreparation)
+        .catch(() => null)
+        .finally(() => {
+          window.clearTimeout(preparationTimeout);
+          triggerHardReload();
+        });
+      return;
+    }
     let reloadTriggered = false;
     const triggerReload = () => {
       if (reloadTriggered) {
@@ -399,9 +448,18 @@
     }).catch(() => {});
   }
 
+  function notifyBsportsfanAttention(kind) {
+    sendRuntimeMessage({
+      type: "lvr:notifyBsportsfanAttention",
+      kind: normalizeText(kind || "security-challenge"),
+      observedAt: Date.now(),
+      url: normalizeUrl(location.href)
+    }).catch(() => {});
+  }
+
   function readLiveSessionRecoveryHistory() {
     try {
-      const raw = window.sessionStorage && window.sessionStorage.getItem(
+      const raw = window.localStorage && window.localStorage.getItem(
         LIVE_SESSION_RECOVERY_STORAGE_KEY
       );
       const parsed = raw ? JSON.parse(raw) : null;
@@ -413,8 +471,8 @@
 
   function writeLiveSessionRecoveryHistory(value) {
     try {
-      if (window.sessionStorage) {
-        window.sessionStorage.setItem(
+      if (window.localStorage) {
+        window.localStorage.setItem(
           LIVE_SESSION_RECOVERY_STORAGE_KEY,
           JSON.stringify(value && typeof value === "object" ? value : {})
         );
@@ -426,8 +484,12 @@
 
   function clearLiveSessionRecoveryHistory() {
     try {
+      if (window.localStorage) {
+        window.localStorage.removeItem(LIVE_SESSION_RECOVERY_STORAGE_KEY);
+        window.localStorage.removeItem(LEGACY_LIVE_SESSION_RECOVERY_STORAGE_KEY);
+      }
       if (window.sessionStorage) {
-        window.sessionStorage.removeItem(LIVE_SESSION_RECOVERY_STORAGE_KEY);
+        window.sessionStorage.removeItem(LEGACY_LIVE_SESSION_RECOVERY_STORAGE_KEY);
       }
     } catch (_) {
       // Optional loop-protection state.
@@ -835,6 +897,7 @@
     }
 
     const now = Date.now();
+    const firstObservation = !visibleChallengeActive;
     visibleChallengeActive = true;
     visibleHealthyReported = false;
     inlineAutoForecastQueue.clear();
@@ -845,13 +908,13 @@
       job.preemptRequestedAt = now;
     }
 
-    if (now - visibleChallengeLastReportedAt >= 30 * 1000) {
+    if (now - visibleChallengeLastReportedAt >= 5 * 60 * 1000) {
       visibleChallengeLastReportedAt = now;
       sendRuntimeMessage({
         type: "lvr:reportBsportsfanProtection",
         reason: "visible-bsportsfan-security-challenge",
         code: "bsportsfan-challenge",
-        retryAfterMs: BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS,
+        retryAfterMs: BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS,
         observedAt: now,
         url: normalizeUrl(location.href)
       }).catch(() => {});
@@ -868,6 +931,9 @@
           }
         }
       }).catch(() => {});
+    }
+    if (firstObservation) {
+      notifyBsportsfanAttention("security-challenge");
     }
     return true;
   }
@@ -2684,8 +2750,8 @@
       }
       archive.forecast = {
         status: "not-ready",
-        source: "match-start-history-pbp",
-        model: "history-pbp-4factor-start-only",
+        source: "match-start-z0-market-consensus",
+        model: "z0-pbp-with-causal-opening-market",
         modelVersion: MATCH_START_RULE_ID,
         message: archive.skipReason,
         features: {},
@@ -6020,8 +6086,8 @@
     const deliveryEntryState = buildInlineForecastEntryState(seed, "delivery");
     const forecast = {
       status: "not-ready",
-      source: "match-start-history-pbp",
-      model: "history-pbp-4factor-start-only",
+      source: "match-start-z0-market-consensus",
+      model: "z0-pbp-with-causal-opening-market",
       modelVersion: MATCH_START_RULE_ID,
       message: `сбор данных недоступен: ${stringifyError(error) || "unknown"}`,
       features: {}
@@ -6817,8 +6883,12 @@
       });
       return Promise.resolve({ sent: false, reason: "results-page-forecast-disabled" });
     }
-    const decision = buildInlineForecastDecision(archive) || {};
-    const prediction = buildPrematchTelegramPredictionPayload(matchUrl, archive, decision);
+    const decisionArchive = {
+      ...archive,
+      finalDecisionAt: Date.now()
+    };
+    const decision = buildInlineForecastDecision(decisionArchive) || {};
+    const prediction = buildPrematchTelegramPredictionPayload(matchUrl, decisionArchive, decision);
     if (decision.action !== "forecast") {
       const reason = normalizeText(decision.reason || "prematch-not-qualified");
       const recorded = recordTelegramDatasetEvent(matchUrl, {
@@ -7055,23 +7125,48 @@
     const startEntryState = orientInlineForecastEntryState(archive && archive.startEntryState, predictedSide);
     const deliveryEntryState = orientInlineForecastEntryState(archive && archive.deliveryEntryState, predictedSide);
     const readyAt = Number(archive && archive.readyAt || 0) || Date.now();
+    const finalDecisionAt = Number(decision && decision.finalDecisionAt || archive && archive.finalDecisionAt || 0)
+      || readyAt;
     const noOddsModel = normalizeText(oddsMeaning).toLowerCase() === "none";
-    const observedMoneylineMarket = buildSelectedMoneylineMarketSnapshot(
-      archive && archive.targetOdds,
-      predictedSide,
-      readyAt,
-      players
-    );
-    const moneylineMarket = noOddsModel ? null : observedMoneylineMarket;
-    const referenceMoneylineMarket = Number(observedMoneylineMarket && observedMoneylineMarket.leftOdds) > 1
+    const decisionMoneylineMarket = decision && decision.referenceMoneylineMarket
+      && typeof decision.referenceMoneylineMarket === "object"
+      ? decision.referenceMoneylineMarket
+      : decision && decision.moneylineMarket && typeof decision.moneylineMarket === "object"
+        ? decision.moneylineMarket
+        : null;
+    const usesFrozenMarketModel = normalizeText(oddsMeaning).toLowerCase()
+      === "optional-prematch-market-consensus";
+    const observedMoneylineMarket = usesFrozenMarketModel
+      ? decisionMoneylineMarket
+      : decisionMoneylineMarket || buildSelectedMoneylineMarketSnapshot(
+          archive && archive.targetOdds,
+          predictedSide,
+          finalDecisionAt,
+          players
+        );
+    const referenceMoneylineMarket = normalizeText(
+      observedMoneylineMarket && observedMoneylineMarket.status
+    ).toLowerCase() === "ready"
+      && normalizeText(observedMoneylineMarket && observedMoneylineMarket.marketType).toLowerCase()
+        === "matchresult"
+      && normalizeText(observedMoneylineMarket && observedMoneylineMarket.quoteSource).toLowerCase()
+        === "opening"
+      && Number(observedMoneylineMarket && observedMoneylineMarket.observedAt) > 0
+      && Number(observedMoneylineMarket && observedMoneylineMarket.observedAt) <= finalDecisionAt
+      && Number(observedMoneylineMarket && observedMoneylineMarket.leftOdds) > 1
       && Number(observedMoneylineMarket && observedMoneylineMarket.rightOdds) > 1
       ? {
           ...observedMoneylineMarket,
-          usage: "display-only",
-          modelInput: false
+          usage: "model-input",
+          modelInput: true
         }
       : null;
-    const moneylineOdds = Number(moneylineMarket && moneylineMarket.selectedOdds);
+    const moneylineMarket = noOddsModel ? null : referenceMoneylineMarket;
+    const moneylineOdds = predictedSide === 0
+      ? Number(moneylineMarket && moneylineMarket.leftOdds)
+      : predictedSide === 1
+        ? Number(moneylineMarket && moneylineMarket.rightOdds)
+        : NaN;
     const referenceLeftOdds = Number(referenceMoneylineMarket && referenceMoneylineMarket.leftOdds);
     const referenceRightOdds = Number(referenceMoneylineMarket && referenceMoneylineMarket.rightOdds);
     const referencePlayerOdds = predictedSide === 0
@@ -7108,6 +7203,7 @@
       requestedAt: Number(archive && archive.requestedAt || 0) || "",
       collectionStartedAt: Number(archive && archive.collectionStartedAt || 0) || "",
       readyAt,
+      finalDecisionAt,
       collectionLatencyMs: Number(archive && archive.collectionLatencyMs || 0),
       deliveryObservedAt: Number(archive && archive.deliveryObservedAt || 0) || "",
       deliveryMode: normalizeText(archive && archive.deliveryMode || deliveryEntryState && deliveryEntryState.mode || "unknown"),
@@ -7131,7 +7227,7 @@
       moneylineOdds: Number.isFinite(moneylineOdds) && moneylineOdds > 1
         ? roundDecimal(moneylineOdds, 3)
         : "",
-      referenceOddsMeaning: referenceMoneylineMarket ? "display-only-match-winner" : "none",
+      referenceOddsMeaning: referenceMoneylineMarket ? "model-input-match-winner" : "none",
       leftFreshForm3Score: freshForm3Scores[0],
       rightFreshForm3Score: freshForm3Scores[1],
       leftStrengthScore: strengthScores[0],
@@ -7164,6 +7260,8 @@
         probabilityMeaning: decision && decision.probabilityMeaning || "leader by recent two-set coverage frequency",
         modelProbability: finiteNumberOrNull(decision && decision.probability) ?? "",
         internalScore: finiteNumberOrNull(decision && decision.score) ?? "",
+        finalDecisionAt: Number(decision && decision.finalDecisionAt || archive && archive.finalDecisionAt || 0)
+          || Date.now(),
         features: decision && decision.features || {}
       }
     };
@@ -7420,6 +7518,7 @@
 
   function evaluateCurrentStartPair(context = {}) {
     const telegramContext = buildPrematchTelegramContext(context);
+    const finalDecisionAt = Number(context && context.finalDecisionAt || 0) || Date.now();
     const blockedLeague = isPrematchTelegramBlockedLeagueName(telegramContext.leagueName);
     const shadowOnlyLeague = isPrematchTelegramShadowOnlyLeagueName(telegramContext.leagueName);
     const leagueMode = blockedLeague
@@ -7443,40 +7542,54 @@
     const historySelectedSideIndex = evaluation.sideIndex === 0 || evaluation.sideIndex === 1
       ? evaluation.sideIndex
       : null;
-    const livePointCorrectionEvaluator = globalThis.LvrStartMatchRule
-      && globalThis.LvrStartMatchRule.applyLivePointDeficitCorrection;
-    const livePointCorrection = typeof livePointCorrectionEvaluator === "function"
-      ? livePointCorrectionEvaluator({
-          selectedSideIndex: historySelectedSideIndex,
-          deliveryEntryState: context && context.deliveryEntryState
+    const playerNames = players.map((player) => player && player.name || "");
+    const observedMoneylineMarket = buildSelectedMoneylineMarketSnapshot(
+      context && context.targetOdds,
+      historySelectedSideIndex,
+      finalDecisionAt,
+      playerNames
+    );
+    const frozenMoneylineMarket = observedMoneylineMarket.status === "ready"
+      && normalizeText(observedMoneylineMarket.marketType).toLowerCase() === "matchresult"
+      && normalizeText(observedMoneylineMarket.quoteSource).toLowerCase() === "opening"
+      && Number(observedMoneylineMarket.leftOdds) > 1
+      && Number(observedMoneylineMarket.rightOdds) > 1
+      ? {
+          ...observedMoneylineMarket,
+          usage: "model-input",
+          modelInput: true
+        }
+      : null;
+    const sideGuardState = context && context.sideGuardState && typeof context.sideGuardState === "object"
+      ? context.sideGuardState
+      : {};
+    const sideGuardEvaluator = globalThis.LvrSideCorrectionGuard
+      && globalThis.LvrSideCorrectionGuard.evaluate;
+    const sideGuard = typeof sideGuardEvaluator === "function"
+      ? sideGuardEvaluator({
+          historySideIndex: historySelectedSideIndex,
+          baseSideIndex: evaluation.baseSideIndex,
+          pairedOutcomes: sideGuardState.pairedOutcomes,
+          stateHash: sideGuardState.stateHash
         })
       : {
-          ruleId: "",
-          threshold: -4,
+          ruleId: MATCH_START_SIDE_GUARD_RULE_ID,
+          eligible: false,
+          reason: "side-guard-missing",
           historySideIndex: historySelectedSideIndex,
-          finalSideIndex: historySelectedSideIndex,
-          applied: false,
-          reason: "live-point-correction-missing",
-          selectedPointLead: null,
-          leftPoints: null,
-          rightPoints: null
-        };
-    const decisionInputHashEvaluator = globalThis.LvrStartMatchRule
-      && globalThis.LvrStartMatchRule.fingerprintDecision;
-    const decisionInputHash = typeof decisionInputHashEvaluator === "function"
-      ? decisionInputHashEvaluator({
-          profiles,
+          baseSideIndex: evaluation.baseSideIndex === 0 || evaluation.baseSideIndex === 1
+            ? evaluation.baseSideIndex
+            : null,
+          sidesDisagree: false,
+          pairedOutcomes: [],
+          qualifyingSettled: 0,
+          pairSum: 0,
+          windowSize: 3,
+          selectedSource: "history-pbp",
           selectedSideIndex: historySelectedSideIndex,
-          deliveryEntryState: context && context.deliveryEntryState
-        })
-      : "";
-    const selectedSideIndex = livePointCorrection.finalSideIndex === 0
-      || livePointCorrection.finalSideIndex === 1
-      ? livePointCorrection.finalSideIndex
-      : null;
-    const selectedPlayer = selectedSideIndex === null
-      ? ""
-      : players[selectedSideIndex] && players[selectedSideIndex].name || "";
+          stateHash: "",
+          inputHash: ""
+        };
     const pairRegimeEvaluator = globalThis.LvrVerifiedPairRegimeV1
       && globalThis.LvrVerifiedPairRegimeV1.evaluate;
     const pairRegime = typeof pairRegimeEvaluator === "function"
@@ -7486,7 +7599,9 @@
           pointWindowSize: evaluation.pointWindowSize,
           relativeAgreementScore: evaluation.sideCorrection && evaluation.sideCorrection.agreementScore,
           latestPbpReversal: evaluation.sideCorrection && evaluation.sideCorrection.latestReversal,
-          leagueName: telegramContext.leagueName
+          leagueName: telegramContext.leagueName,
+          moneylineMarket: frozenMoneylineMarket,
+          decisionAt: finalDecisionAt
         })
       : {
           protocolId: MATCH_START_PAIR_PROTOCOL.id || "",
@@ -7500,12 +7615,41 @@
           accepted: false,
           reason: "production-pbp-filter-missing",
           leagueClass: leagueMode,
+          baseSelectedSideIndex: historySelectedSideIndex,
           selectedSideIndex: historySelectedSideIndex,
           pointWindowSize: evaluation.pointWindowSize,
           inputHash: "",
+          marketReady: false,
+          marketReason: "pair-regime-missing",
+          marketType: frozenMoneylineMarket && frozenMoneylineMarket.marketType || "matchResult",
+          marketQuoteSource: frozenMoneylineMarket && frozenMoneylineMarket.quoteSource || "",
+          marketObservedAt: finiteNumberOrNull(frozenMoneylineMarket && frozenMoneylineMarket.observedAt),
+          marketDecisionAt: finalDecisionAt,
+          marketLeftOdds: finiteNumberOrNull(frozenMoneylineMarket && frozenMoneylineMarket.leftOdds),
+          marketRightOdds: finiteNumberOrNull(frozenMoneylineMarket && frozenMoneylineMarket.rightOdds),
+          marketLeftImpliedProbability: null,
+          marketRightImpliedProbability: null,
+          marketFavoriteSideIndex: null,
+          marketFavoriteProbability: null,
+          marketSideOverrideApplied: false,
+          marketSalvageAccepted: false,
+          marketSnapshot: frozenMoneylineMarket,
           sumWithinLimit: false,
           countsUnequal: false
         };
+    const selectedSideIndex = pairRegime.selectedSideIndex === 0
+      || pairRegime.selectedSideIndex === 1
+      ? pairRegime.selectedSideIndex
+      : null;
+    const selectedPlayer = selectedSideIndex === null
+      ? ""
+      : players[selectedSideIndex] && players[selectedSideIndex].name || "";
+    const decisionInputHash = pairRegime.inputHash || "";
+    const referenceMoneylineMarket = pairRegime.marketReady === true
+      && frozenMoneylineMarket
+      && frozenMoneylineMarket.status === "ready"
+      ? frozenMoneylineMarket
+      : null;
     const scores = [0, 1].map((index) => evaluation.scores && evaluation.scores[index] || {});
     const histories = players.map((player) => summarizePrematchTwoSetScoreHistory(player && player.scoreHistory));
     const points = players.map((player) => player && player.pointProfile || {});
@@ -7518,7 +7662,11 @@
       profiles,
       evaluation,
       historySelectedSideIndex,
-      livePointCorrection,
+      sideGuardState,
+      sideGuard,
+      finalDecisionAt,
+      frozenMoneylineMarket,
+      referenceMoneylineMarket,
       decisionInputHash,
       selectedSideIndex,
       selectedPlayer,
@@ -7538,7 +7686,11 @@
       profiles,
       evaluation,
       historySelectedSideIndex,
-      livePointCorrection,
+      sideGuardState,
+      sideGuard,
+      finalDecisionAt,
+      frozenMoneylineMarket,
+      referenceMoneylineMarket,
       decisionInputHash,
       selectedSideIndex,
       selectedPlayer,
@@ -7552,7 +7704,8 @@
       pairRegime
       && pairRegime.eligible === true
       && pairRegime.accepted === true
-      && pairRegime.selectedSideIndex === historySelectedSideIndex
+      && pairRegime.baseSelectedSideIndex === historySelectedSideIndex
+      && (pairRegime.selectedSideIndex === 0 || pairRegime.selectedSideIndex === 1)
     );
     const action = !blockedLeague
       && startEligibility.accepted
@@ -7585,15 +7738,27 @@
       startMatchBaseSelectedSideIndex: evaluation.baseSideIndex === 0 || evaluation.baseSideIndex === 1
         ? evaluation.baseSideIndex
         : "",
-      startMatchLivePointCorrectionRuleId: livePointCorrection.ruleId || "",
-      startMatchLivePointCorrectionApplied: livePointCorrection.applied ? 1 : 0,
-      startMatchLivePointCorrectionThreshold: finiteNumberOrNull(livePointCorrection.threshold) ?? "",
-      startMatchLivePointCorrectionSelectedLead: finiteNumberOrNull(
-        livePointCorrection.selectedPointLead
+      startMatchSideGuardRuleId: sideGuard.ruleId || MATCH_START_SIDE_GUARD_RULE_ID,
+      startMatchSideGuardHistorySideIndex: sideGuard.historySideIndex ?? "",
+      startMatchSideGuardBaseSideIndex: sideGuard.baseSideIndex ?? "",
+      startMatchSideGuardSelectedSideIndex: sideGuard.selectedSideIndex ?? "",
+      startMatchSideGuardSidesDisagree: sideGuard.sidesDisagree ? 1 : 0,
+      startMatchSideGuardWindowSize: finiteNumberOrNull(sideGuard.windowSize) ?? "",
+      startMatchSideGuardQualifyingSettled: finiteNumberOrNull(sideGuard.qualifyingSettled) ?? "",
+      startMatchSideGuardPairSum: finiteNumberOrNull(sideGuard.pairSum) ?? "",
+      startMatchSideGuardSelectedSource: sideGuard.selectedSource || "",
+      startMatchSideGuardReason: sideGuard.reason || "",
+      startMatchSideGuardInputHash: sideGuard.inputHash || "",
+      startMatchSideGuardPairOutcomes: Array.isArray(sideGuard.pairedOutcomes)
+        ? sideGuard.pairedOutcomes.slice(-3)
+        : [],
+      startMatchSideGuardStateCutoffAt: finiteNumberOrNull(sideGuardState.stateCutoffAt) ?? "",
+      startMatchSideGuardStateThroughSettledAt: finiteNumberOrNull(
+        sideGuardState.stateThroughSettledAt
       ) ?? "",
-      startMatchLivePointCorrectionLeftPoints: finiteNumberOrNull(livePointCorrection.leftPoints) ?? "",
-      startMatchLivePointCorrectionRightPoints: finiteNumberOrNull(livePointCorrection.rightPoints) ?? "",
-      startMatchLivePointCorrectionReason: livePointCorrection.reason || "",
+      startMatchSideGuardStateHash: sideGuardState.stateHash || "",
+      startMatchSideGuardStateSource: sideGuardState.source || "",
+      startMatchSideGuardStateSourceCount: finiteNumberOrNull(sideGuardState.sourceCount) ?? "",
       startMatchSideCorrectionApplied: evaluation.sideCorrection && evaluation.sideCorrection.applied ? 1 : 0,
       startMatchSideCorrectionReason: evaluation.sideCorrection && evaluation.sideCorrection.reason || "",
       startMatchRelativeAgreementScore: finiteNumberOrNull(
@@ -7603,15 +7768,75 @@
       startMatchInputHash: evaluation.inputHash || "",
       startMatchDecisionInputHash: decisionInputHash,
       startMatchFormulaId: evaluation.formulaId || "",
+      startMatchZ0Score: finiteNumberOrNull(evaluation.z0Score) ?? "",
+      startMatchZ0LeftP: finiteNumberOrNull(
+        evaluation.z0Inputs && evaluation.z0Inputs[0] && evaluation.z0Inputs[0].latestStrengthScore
+      ) ?? "",
+      startMatchZ0RightP: finiteNumberOrNull(
+        evaluation.z0Inputs && evaluation.z0Inputs[1] && evaluation.z0Inputs[1].latestStrengthScore
+      ) ?? "",
+      startMatchZ0LeftS3: finiteNumberOrNull(
+        evaluation.z0Inputs && evaluation.z0Inputs[0] && evaluation.z0Inputs[0].history3SetSharePct
+      ) ?? "",
+      startMatchZ0RightS3: finiteNumberOrNull(
+        evaluation.z0Inputs && evaluation.z0Inputs[1] && evaluation.z0Inputs[1].history3SetSharePct
+      ) ?? "",
+      startMatchZ0LeftL: finiteNumberOrNull(
+        evaluation.z0Inputs && evaluation.z0Inputs[0] && evaluation.z0Inputs[0].latestOwnSets
+      ) ?? "",
+      startMatchZ0RightL: finiteNumberOrNull(
+        evaluation.z0Inputs && evaluation.z0Inputs[1] && evaluation.z0Inputs[1].latestOwnSets
+      ) ?? "",
+      startMatchZ0LeftF3: finiteNumberOrNull(
+        evaluation.z0Inputs && evaluation.z0Inputs[0] && evaluation.z0Inputs[0].freshForm3Score
+      ) ?? "",
+      startMatchZ0RightF3: finiteNumberOrNull(
+        evaluation.z0Inputs && evaluation.z0Inputs[1] && evaluation.z0Inputs[1].freshForm3Score
+      ) ?? "",
+      startMatchLegacySelectedSideIndex: evaluation.legacySideIndex === 0 || evaluation.legacySideIndex === 1
+        ? evaluation.legacySideIndex
+        : "",
+      startMatchLegacyRawScoreDelta: finiteNumberOrNull(evaluation.legacyRawScoreDelta) ?? "",
       startMatchCoverageTier: evaluation.coverageTier || "none",
       startMatchPointWindowSize: finiteNumberOrNull(evaluation.pointWindowSize) ?? "",
       startMatchPairRegimeProtocolId: pairRegime.protocolId || "",
       startMatchPairRegimeGateId: pairRegime.gateId || "",
       startMatchPairRegimeSelectorFormulaId: pairRegime.selectorFormulaId || "",
       startMatchPairRegimeInputHash: pairRegime.inputHash || "",
+      startMatchPairRegimeBaseSelectedSideIndex: pairRegime.baseSelectedSideIndex === 0
+        || pairRegime.baseSelectedSideIndex === 1
+        ? pairRegime.baseSelectedSideIndex
+        : "",
       startMatchPairRegimeSelectedSideIndex: pairRegime.selectedSideIndex === 0 || pairRegime.selectedSideIndex === 1
         ? pairRegime.selectedSideIndex
         : "",
+      startMatchPairRegimeMarketReady: pairRegime.marketReady ? 1 : 0,
+      startMatchPairRegimeMarketReason: pairRegime.marketReason || "",
+      startMatchPairRegimeMarketType: pairRegime.marketType || "",
+      startMatchPairRegimeMarketQuoteSource: pairRegime.marketQuoteSource || "",
+      startMatchPairRegimeMarketObservedAt: finiteNumberOrNull(pairRegime.marketObservedAt) ?? "",
+      startMatchPairRegimeMarketDecisionAt: finiteNumberOrNull(pairRegime.marketDecisionAt) ?? "",
+      startMatchPairRegimeMarketLeftOdds: finiteNumberOrNull(pairRegime.marketLeftOdds) ?? "",
+      startMatchPairRegimeMarketRightOdds: finiteNumberOrNull(pairRegime.marketRightOdds) ?? "",
+      startMatchPairRegimeMarketLeftImpliedProbability: finiteNumberOrNull(
+        pairRegime.marketLeftImpliedProbability
+      ) ?? "",
+      startMatchPairRegimeMarketRightImpliedProbability: finiteNumberOrNull(
+        pairRegime.marketRightImpliedProbability
+      ) ?? "",
+      startMatchPairRegimeMarketFavoriteSideIndex: pairRegime.marketFavoriteSideIndex === 0
+        || pairRegime.marketFavoriteSideIndex === 1
+        ? pairRegime.marketFavoriteSideIndex
+        : "",
+      startMatchPairRegimeMarketFavoriteProbability: finiteNumberOrNull(
+        pairRegime.marketFavoriteProbability
+      ) ?? "",
+      startMatchPairRegimeMarketSideOverrideApplied: pairRegime.marketSideOverrideApplied ? 1 : 0,
+      startMatchPairRegimeMarketSalvageAccepted: pairRegime.marketSalvageAccepted ? 1 : 0,
+      startMatchPairRegimeMarketSnapshot: pairRegime.marketSnapshot
+        && typeof pairRegime.marketSnapshot === "object"
+        ? pairRegime.marketSnapshot
+        : frozenMoneylineMarket,
       startMatchPairRegimePointWindowSize: finiteNumberOrNull(pairRegime.pointWindowSize) ?? "",
       startMatchPairRegimeDataReady: pairRegime.dataReady ? 1 : 0,
       startMatchPairRegimeEligible: pairRegime.eligible ? 1 : 0,
@@ -7654,8 +7879,8 @@
       startMatchProductionAccepted: productionPairRegimeAccepted ? 1 : 0,
       startMatchLeagueMode: leagueMode,
       startMatchLeaguePublishAccepted: leagueMode === "production" && productionPairRegimeAccepted ? 1 : 0,
-      startMatchUsesOdds: 0,
-      startMatchUsesCurrentScore: 1,
+      startMatchUsesOdds: pairRegime.marketReady ? 1 : 0,
+      startMatchUsesCurrentScore: 0,
       startMatchProfiles: profiles,
       startMatchLeftStrength: finiteNumberOrNull(scores[0].strength) ?? "",
       startMatchRightStrength: finiteNumberOrNull(scores[1].strength) ?? "",
@@ -7675,19 +7900,22 @@
     };
     return {
       action,
-      source: "match-start-history-pbp",
-      model: "history-pbp-4factor-start-only",
+      source: "match-start-z0-market-consensus",
+      model: "z0-pbp-with-causal-opening-market",
       modelVersion: MATCH_START_RULE_ID,
       coverageRuleId: MATCH_START_RULE_ID,
-      noMarketCoverage: true,
+      noMarketCoverage: pairRegime.marketReady !== true,
       reason,
       playerName: selectedPlayer,
       sideIndex: selectedSideIndex,
       betType: "two_sets",
-      oddsMeaning: "none",
-      probabilityMeaning: "comparative history/PBP index; not a calibrated probability",
+      oddsMeaning: "optional-prematch-market-consensus",
+      probabilityMeaning: "comparative Z0/PBP index with optional prematch market consensus; not a calibrated probability",
       probability: "",
       score: selectedSideIndex === null ? "" : finiteNumberOrNull(scores[selectedSideIndex].overall) ?? "",
+      finalDecisionAt,
+      moneylineMarket: referenceMoneylineMarket,
+      referenceMoneylineMarket,
       leagueName: telegramContext.leagueName,
       signalMode: pairRegime.signalMode || "rejected",
       features
@@ -7704,7 +7932,12 @@
       histories
     } = evaluateCurrentStartPair(context);
     const modelReady = Boolean(evaluation.eligible && selectedPlayer && pairRegime.dataReady);
-    const qualified = Boolean(modelReady && pairRegime.moderateAccepted);
+    const qualified = Boolean(modelReady && pairRegime.accepted);
+    const shadowQualified = Boolean(
+      modelReady
+      && pairRegime.shadowOnly
+      && (pairRegime.moderateAccepted || pairRegime.marketSalvageAccepted)
+    );
     const message = !evaluation.eligible
       ? evaluation.reason
       : !selectedPlayer
@@ -7715,15 +7948,21 @@
             ? "Боевой фильтр подтверждён."
             : pairRegime.reason;
     return {
-      status: qualified ? "ready" : modelReady ? "pass" : "not-ready",
-      source: "match-start-history-pbp",
-      model: "history-pbp-4factor-start-only",
+      status: qualified ? "ready" : shadowQualified ? "shadow" : modelReady ? "pass" : "not-ready",
+      source: "match-start-z0-market-consensus",
+      model: "z0-pbp-with-causal-opening-market",
       modelVersion: MATCH_START_RULE_ID,
       sideIndex: selectedSideIndex,
       player: selectedPlayer,
-      label: qualified ? "2+ сета · боевой фильтр" : "Нет сигнала",
+      label: qualified
+        ? "2+ сета · боевой фильтр"
+        : shadowQualified
+          ? "TT Cup · расчёт без отправки"
+          : "Нет сигнала",
       title: qualified
         ? `${selectedPlayer}: выбран текущей моделью и прошёл боевой фильтр`
+        : shadowQualified
+          ? `${selectedPlayer}: расчёт сохранён, Telegram для TT Cup выключен`
         : message,
       message,
       features: {
@@ -9774,18 +10013,24 @@
   }
 
   function reportBsportsfanProtection(error) {
+    const challenge = isBsportsfanChallengeError(error);
     sendRuntimeMessage({
       type: "lvr:reportBsportsfanProtection",
       reason: normalizeText(error && error.message || "bsportsfan-challenge"),
       code: normalizeText(error && error.code || "bsportsfan-challenge"),
       status: Number(error && error.status || 0) || 0,
       retryAfterMs: Math.max(
-        BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS,
+        challenge
+          ? BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS
+          : BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS,
         Number(error && error.retryAfterMs || 0) || 0
       ),
       observedAt: Date.now(),
       url: normalizeUrl(location.href)
     }).catch(() => {});
+    if (challenge) {
+      notifyBsportsfanAttention("security-challenge");
+    }
   }
 
   function getBsportsfanNavigationProtectionError(now = Date.now()) {
