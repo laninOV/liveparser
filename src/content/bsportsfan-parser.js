@@ -279,6 +279,7 @@
         type: "lvr:reportBsportsfanProtection",
         reason: "live-session-manual-recovery-required",
         code: "bsportsfan-session-expired",
+        manualRequired: true,
         retryAfterMs: BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS,
         observedAt: recovery.detectedAt,
         url: normalizeUrl(location.href)
@@ -914,6 +915,7 @@
         type: "lvr:reportBsportsfanProtection",
         reason: "visible-bsportsfan-security-challenge",
         code: "bsportsfan-challenge",
+        manualRequired: true,
         retryAfterMs: BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS,
         observedAt: now,
         url: normalizeUrl(location.href)
@@ -10013,24 +10015,18 @@
   }
 
   function reportBsportsfanProtection(error) {
-    const challenge = isBsportsfanChallengeError(error);
     sendRuntimeMessage({
       type: "lvr:reportBsportsfanProtection",
       reason: normalizeText(error && error.message || "bsportsfan-challenge"),
       code: normalizeText(error && error.code || "bsportsfan-challenge"),
       status: Number(error && error.status || 0) || 0,
       retryAfterMs: Math.max(
-        challenge
-          ? BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS
-          : BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS,
+        BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS,
         Number(error && error.retryAfterMs || 0) || 0
       ),
       observedAt: Date.now(),
       url: normalizeUrl(location.href)
     }).catch(() => {});
-    if (challenge) {
-      notifyBsportsfanAttention("security-challenge");
-    }
   }
 
   function getBsportsfanNavigationProtectionError(now = Date.now()) {

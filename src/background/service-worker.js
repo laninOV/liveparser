@@ -91,6 +91,7 @@ const BSPORTSFAN_ATTENTION_NOTIFICATION_TTL_MS = 60 * 60 * 1000;
 const BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS = 6 * 60 * 60 * 1000;
 const BSPORTSFAN_HEALTH_ALARM_NAME = "lvr-bsportsfan-health";
 const BSPORTSFAN_HEALTH_STALE_MS = 2 * 60 * 1000;
+const BSPORTSFAN_PROGRESS_STALE_MS = 3 * 60 * 1000;
 const BSPORTSFAN_HEALTH_RELOAD_COOLDOWN_MS = 15 * 60 * 1000;
 const BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY = "bsportsfanHealthWatchdog";
 const BSPORTSFAN_NAVIGATION_LEASE_STORAGE_KEY = "bsportsfanNavigationLeaseState";
@@ -230,10 +231,32 @@ async function runBsportsfanHealthWatchdog(now = Date.now()) {
     return { reloaded: false, reason: "manual-or-recovery-active" };
   }
   const heartbeatAt = Number(scanStatus && scanStatus.ts || 0);
-  if (!(heartbeatAt > 0) || now - heartbeatAt < BSPORTSFAN_HEALTH_STALE_MS) {
-    return { reloaded: false, reason: "heartbeat-healthy" };
+  const heartbeatStale = !(heartbeatAt > 0) || now - heartbeatAt >= BSPORTSFAN_HEALTH_STALE_MS;
+  const progress = summarizeBsportsfanCollectorProgress(scanStatus, now);
+  const previous = storage[BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY]
+    && typeof storage[BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY] === "object"
+    ? storage[BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY]
+    : {};
+  const progressChanged = progress.signature !== normalizeTelegramText(previous.progressSignature || "");
+  const progressObservedAt = progressChanged
+    ? now
+    : Number(previous.progressObservedAt || 0) || now;
+  if (!heartbeatStale && (!progress.active || now - progressObservedAt < BSPORTSFAN_PROGRESS_STALE_MS)) {
+    await chrome.storage.local.set({
+      [BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY]: {
+        ...previous,
+        progressSignature: progress.signature,
+        progressObservedAt,
+        heartbeatAt,
+        activeWork: progress.active,
+        updatedAt: now
+      }
+    });
+    return {
+      reloaded: false,
+      reason: progress.active ? "collector-progressing" : "heartbeat-healthy"
+    };
   }
-  const previous = storage[BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY];
   const lastReloadAt = Number(previous && previous.lastReloadAt || 0);
   if (lastReloadAt > 0 && now - lastReloadAt < BSPORTSFAN_HEALTH_RELOAD_COOLDOWN_MS) {
     return { reloaded: false, reason: "reload-cooldown" };
@@ -260,11 +283,83 @@ async function runBsportsfanHealthWatchdog(now = Date.now()) {
       lastReloadAt: now,
       tabId: tab.id,
       heartbeatAt,
+      progressSignature: progress.signature,
+      progressObservedAt: now,
+      activeWork: progress.active,
       updatedAt: now
     }
   });
   await chrome.tabs.reload(tab.id);
-  return { reloaded: true, tabId: tab.id, heartbeatAgeMs: now - heartbeatAt };
+  return {
+    reloaded: true,
+    tabId: tab.id,
+    reason: heartbeatStale ? "heartbeat-stalled" : "collector-progress-stalled",
+    heartbeatAgeMs: heartbeatAt > 0 ? now - heartbeatAt : null
+  };
+}
+
+function summarizeBsportsfanCollectorProgress(scanStatus, now = Date.now()) {
+  const monitor = scanStatus && scanStatus.bsportsfan
+    && scanStatus.bsportsfan.cipMonitor
+    && typeof scanStatus.bsportsfan.cipMonitor === "object"
+    ? scanStatus.bsportsfan.cipMonitor
+    : {};
+  const forecastStates = monitor.forecastStates && typeof monitor.forecastStates === "object"
+    ? monitor.forecastStates
+    : {};
+  const matchStartStates = monitor.matchStartStates && typeof monitor.matchStartStates === "object"
+    ? monitor.matchStartStates
+    : {};
+  const activeJobs = Array.isArray(monitor.forecastActiveJobs)
+    ? monitor.forecastActiveJobs.map((job) => normalizeTelegramText(
+        job && (job.matchUrl || job.url) || job || ""
+      )).filter(Boolean).sort()
+    : [];
+  const errors = Array.isArray(monitor.forecastErrors) ? monitor.forecastErrors : [];
+  const overdueCooling = errors.some((error) => (
+    error && error.terminal !== true
+    && Number.isFinite(Number(error.retryAt))
+    && Number(error.retryAt) > 0
+    && Number(error.retryAt) + 60 * 1000 <= now
+  ));
+  const active = activeJobs.length > 0
+    || Number(monitor.forecastActiveWorkers || 0) > 0
+    || Number(monitor.forecastQueueSize || 0) > 0
+    || Number(forecastStates.loading || 0) > 0
+    || Number(matchStartStates.pending || 0) > 0
+    || Number(matchStartStates.sending || 0) > 0
+    || overdueCooling;
+  const details = Array.isArray(monitor.matchStartDetails)
+    ? monitor.matchStartDetails.map((item) => [
+        normalizeTelegramText(item && item.matchUrl || ""),
+        normalizeTelegramText(item && item.status || ""),
+        Number(item && item.updatedAt || 0)
+      ])
+    : [];
+  return {
+    active,
+    signature: JSON.stringify([
+      activeJobs,
+      Number(monitor.forecastActiveWorkers || 0),
+      Number(monitor.forecastQueueSize || 0),
+      Number(forecastStates.loading || 0),
+      Number(forecastStates.cooling || 0),
+      Number(forecastStates.ready || 0),
+      Number(forecastStates.modelReady || 0),
+      Number(forecastStates.modelPass || 0),
+      Number(forecastStates.terminal || 0),
+      Number(matchStartStates.pending || 0),
+      Number(matchStartStates.sending || 0),
+      Number(matchStartStates.sent || 0),
+      Number(matchStartStates.decided || 0),
+      Number(matchStartStates.expired || 0),
+      Number(scanStatus && scanStatus.fetched || 0),
+      Number(scanStatus && scanStatus.skipped || 0),
+      Number(scanStatus && scanStatus.lastErrorCount || 0),
+      overdueCooling,
+      details
+    ])
+  };
 }
 
 function isBootstrapIndependentMessage(message) {
@@ -354,10 +449,17 @@ async function handleMessage(message, sender = null) {
 
   if (message.type === "lvr:reportBsportsfanProtection") {
     await ensureBsportsfanProtectionStateLoaded();
+    const manualRequired = message.manualRequired === true;
+    const minimumCooldownMs = manualRequired
+      ? BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS
+      : BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS;
+    const maximumCooldownMs = manualRequired
+      ? BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS
+      : 30 * 60 * 1000;
     const requestedCooldownMs = Math.min(
-      BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS,
+      maximumCooldownMs,
       Math.max(
-        BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS,
+        minimumCooldownMs,
         Number(message.retryAfterMs || 0) || 0
       )
     );
@@ -366,17 +468,13 @@ async function handleMessage(message, sender = null) {
       Number(message.status || 0) || 0,
       requestedCooldownMs
     );
-    const notification = normalizeTelegramText(message.code || "") === "bsportsfan-challenge"
-      ? await notifyBsportsfanAttention(message).catch((error) => ({
-          notified: false,
-          reason: "notification-error",
-          error: stringifyError(error)
-        }))
-      : null;
+    scheduleTelegramStatsRefresh("collector-protection", {
+      createMissing: false,
+      force: false
+    });
     return {
       reported: true,
-      retryAfterMs: Math.max(0, bsportsfanProtectionOpenUntil - Date.now()),
-      notification
+      retryAfterMs: Math.max(0, bsportsfanProtectionOpenUntil - Date.now())
     };
   }
 
@@ -388,6 +486,12 @@ async function handleMessage(message, sender = null) {
     validateBsportsfanProxySender(sender);
     await ensureBsportsfanProtectionStateLoaded();
     const cleared = await closeBsportsfanProtectionCircuit();
+    if (cleared) {
+      scheduleTelegramStatsRefresh("collector-healthy", {
+        createMissing: false,
+        force: false
+      });
+    }
     return { healthy: true, cleared };
   }
 
@@ -1458,17 +1562,12 @@ async function fetchBsportsfanText(value, options = {}) {
           error.code,
           status,
           status === 403
-            ? BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS
+            ? BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS
             : BSPORTSFAN_PROXY_REQUEST_RETRY_MS
         );
-        if (status === 403) {
-          notifyBsportsfanAttention({
-            kind: "security-challenge",
-            code: error.code,
-            observedAt: Date.now()
-          }).catch(() => {});
-        }
-        error.retryAfterMs = BSPORTSFAN_PROXY_REQUEST_RETRY_MS;
+        error.retryAfterMs = status === 403
+          ? BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS
+          : BSPORTSFAN_PROXY_REQUEST_RETRY_MS;
       }
       throw error;
     }
@@ -1480,17 +1579,12 @@ async function fetchBsportsfanText(value, options = {}) {
         "bsportsfan-challenge"
       );
       error.status = Number(response.status || 0) || 0;
-      error.retryAfterMs = BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS;
+      error.retryAfterMs = BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS;
       openBsportsfanProtectionCircuit(
         error.code,
         error.status,
-        BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS
+        BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS
       );
-      notifyBsportsfanAttention({
-        kind: "security-challenge",
-        code: error.code,
-        observedAt: Date.now()
-      }).catch(() => {});
       throw error;
     }
     if (isBsportsfanLiveSessionExpiredResponse(text)) {
@@ -6246,9 +6340,69 @@ function pruneTelegramStatsMessageRefs(map) {
 }
 
 async function buildTelegramStatsSummary() {
-  await flushTelegramPredictionPointSnapshots();
-  const rows = await readTelegramPredictionDataset();
-  return summarizeTelegramStatsRows(rows);
+  await Promise.all([
+    flushTelegramPredictionPointSnapshots(),
+    ensureBsportsfanProtectionStateLoaded()
+  ]);
+  const [rows, storage] = await Promise.all([
+    readTelegramPredictionDataset(),
+    chrome.storage.local.get({ scanStatus: null })
+  ]);
+  const summary = summarizeTelegramStatsRows(rows);
+  summary.collectorHealth = buildTelegramCollectorHealth(storage.scanStatus);
+  return summary;
+}
+
+function buildTelegramCollectorHealth(scanStatus, now = Date.now()) {
+  const safeStatus = scanStatus && typeof scanStatus === "object" ? scanStatus : {};
+  const bsportsfan = safeStatus.bsportsfan && typeof safeStatus.bsportsfan === "object"
+    ? safeStatus.bsportsfan
+    : {};
+  const recovery = bsportsfan.sessionRecovery && typeof bsportsfan.sessionRecovery === "object"
+    ? bsportsfan.sessionRecovery
+    : {};
+  const source = normalizeTelegramText(safeStatus.source || "").toLowerCase();
+  if (
+    recovery.manual === true
+    || normalizeTelegramText(recovery.stage || "").toLowerCase() === "manual-required"
+    || source === "bsportsfan-protection"
+    || bsportsfan.challenge === true
+  ) {
+    return {
+      state: "manual",
+      text: "🔴 Сбор: откройте BSportsFan и пройдите проверку"
+    };
+  }
+  if (bsportsfanProtectionOpenUntil > now) {
+    return {
+      state: "cooldown",
+      text: `⏸ Сбор: фоновая пауза до ${formatTelegramStatsTime(bsportsfanProtectionOpenUntil)}`
+    };
+  }
+  const heartbeatAt = Number(safeStatus.ts || 0);
+  if (!(heartbeatAt > 0) || now - heartbeatAt >= BSPORTSFAN_HEALTH_STALE_MS) {
+    return {
+      state: "stale",
+      text: "⚠️ Сбор: нет ответа, включено автовосстановление"
+    };
+  }
+  const monitor = bsportsfan.cipMonitor && typeof bsportsfan.cipMonitor === "object"
+    ? bsportsfan.cipMonitor
+    : {};
+  const visible = Math.max(0, Number(monitor.visibleRows || 0));
+  const waiting = Math.max(0, Number(monitor.waitingRows || 0));
+  const queue = Math.max(0, Number(monitor.forecastQueueSize || 0));
+  const workers = Math.max(0, Number(monitor.forecastActiveWorkers || 0));
+  if (queue > 0 || workers > 0) {
+    return {
+      state: "processing",
+      text: `🔄 Сбор: работает · видно ${visible} · в обработке ${queue + workers}`
+    };
+  }
+  return {
+    state: "healthy",
+    text: `🟢 Сбор: работает · видно ${visible} · ждут старта ${waiting}`
+  };
 }
 
 function summarizeTelegramStatsRows(rows) {
@@ -6975,7 +7129,12 @@ function formatTelegramStatsMessage(summary) {
     "📌 <b>Статистика прогнозов</b>",
     `Обновлено: ${escapeTelegramHtml(formatTelegramStatsTime(safe.updatedAt))}`,
     "",
-    ...formatTelegramSimpleProductionLines(production, productionPair, safe.latestProductionDecision)
+    ...formatTelegramSimpleProductionLines(
+      production,
+      productionPair,
+      safe.latestProductionDecision,
+      safe.collectorHealth
+    )
   ];
   const ttCupLines = formatTelegramSimplePairLines(ttCupPair);
   if (ttCupLines.length) {
@@ -6984,7 +7143,7 @@ function formatTelegramStatsMessage(summary) {
   return lines.join("\n");
 }
 
-function formatTelegramSimpleProductionLines(bucket, pairSummary, latestDecision = null) {
+function formatTelegramSimpleProductionLines(bucket, pairSummary, latestDecision = null, collectorHealth = null) {
   const safe = bucket && typeof bucket === "object" ? bucket : buildTelegramStatsBucket();
   const pair = pairSummary && typeof pairSummary === "object" ? pairSummary : {};
   const published = Math.max(0, Number(safe.bet || 0));
@@ -7005,10 +7164,14 @@ function formatTelegramSimpleProductionLines(bucket, pairSummary, latestDecision
   const latestLine = latestAt > 0
     ? `🕒 Последняя обработка: <b>${escapeTelegramHtml(formatTelegramStatsTime(latestAt))}</b> · ${latestDecision.sent ? "сигнал отправлен" : "матч отброшен"}`
     : "🕒 Последняя обработка: <b>ещё не было</b>";
+  const collectorLine = collectorHealth && normalizeTelegramText(collectorHealth.text || "")
+    ? escapeTelegramHtml(collectorHealth.text)
+    : "⚠️ Сбор: состояние пока неизвестно";
   return [
     "🏆 <b>Кубок Сетки + Чехия</b>",
     `⚙️ Обработано: <b>${formatTelegramStatsMetric(total)}</b> · отправлено: <b>${formatTelegramStatsMetric(published)}</b> · отброшено: <b>${formatTelegramStatsMetric(rejected)}</b>`,
     latestLine,
+    collectorLine,
     `Сигналы: <b>${formatTelegramStatsMetric(published)}</b> из ${formatTelegramStatsMetric(total)} матчей (${formatTelegramStatsMetric(coveragePct)}%)`,
     `✅ Победы: <b>${formatTelegramStatsMetric(wins)}</b> · ❌ Поражения: <b>${formatTelegramStatsMetric(losses)}</b> · ⏳ Ожидают: <b>${formatTelegramStatsMetric(pending)}</b>`,
     `🎯 Проходимость: <b>${formatTelegramSimpleHitRate(wins, settled, safe.hitRatePct)}</b>`
