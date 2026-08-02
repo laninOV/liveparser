@@ -7,18 +7,19 @@
     throw new Error("LvrStartMatchRule must be loaded before LvrVerifiedPairRegimeV1");
   }
   const PROTOCOL = Object.freeze({
-    schemaVersion: 12,
-    id: "start-z0-market-consensus-v12-2026-08-01",
-    gateId: "pbp-or-market-consensus-v2",
+    schemaVersion: 13,
+    id: "start-z0-market-consensus-quality-v13-2026-08-03",
+    gateId: "pbp-or-market-consensus-quality-v3",
     selectorFormulaId: startRule.FORMULA_ID,
     target: "player-takes-two-or-more-sets",
-    registeredAt: "2026-08-01T00:00:00Z",
+    registeredAt: "2026-08-03T00:00:00Z",
     targetEligible: 300,
     minimumReviewSettled: 150,
     productionLeagues: Object.freeze(["setka", "czech"]),
     rules: Object.freeze({
       pointWindow: "same common selector window: 5, otherwise 3",
       gate: "the frozen moderate PBP gate is the base fallback; a rejected match is restored only when causal opening match-result odds agree with Z0 at normalized favorite probability 0.55 or higher",
+      quality: "reject a three-match PBP fallback collected in 60 seconds or more, and reject an absolute Z0 margin below 10",
       side: "use frozen Z0 by default; causal opening match-result favorite replaces it only at normalized favorite probability 0.60 or higher",
       currentScore: "not used for the gate or the final side; live state only confirms that the first set is still in progress"
     })
@@ -34,7 +35,9 @@
     selectedFiveMatchSetShareEdgeMinimum: 10,
     rejectedRelativeAgreementScore: 2.5,
     marketSalvageFavoriteProbabilityMinimum: 0.55,
-    marketSideOverrideFavoriteProbabilityMinimum: 0.6
+    marketSideOverrideFavoriteProbabilityMinimum: 0.6,
+    slowThreeMatchWindowCollectionLatencyRejectAtMs: 60 * 1000,
+    minimumAbsoluteZ0Score: 10
   });
 
   function finiteOrNull(value) {
@@ -242,6 +245,9 @@
     const pointWindowSize = Number(input.pointWindowSize);
     const relativeAgreementScore = finiteOrNull(input.relativeAgreementScore);
     const latestPbpReversal = input.latestPbpReversal === true;
+    const collectionLatencyMs = finiteOrNull(input.collectionLatencyMs);
+    const z0Score = finiteOrNull(input.z0Score);
+    const absoluteZ0Score = z0Score === null ? null : Math.abs(z0Score);
     const leagueClass = classifyLeague(input.leagueName);
     const productionLeague = PROTOCOL.productionLeagues.includes(leagueClass);
     const shadowOnly = leagueClass === "tt-cup-shadow";
@@ -340,14 +346,36 @@
       && relativeAgreementScore === THRESHOLDS.rejectedRelativeAgreementScore
     );
     const moderateAccepted = formulaAccepted && !rejectedByModerateTier;
-    const signalMode = moderateAccepted
+    const qualityInputsReady = Boolean(
+      collectionLatencyMs !== null
+      && collectionLatencyMs >= 0
+      && z0Score !== null
+    );
+    const slowThreeMatchWindowRejected = Boolean(
+      qualityInputsReady
+      && pointWindowSize === 3
+      && collectionLatencyMs >= THRESHOLDS.slowThreeMatchWindowCollectionLatencyRejectAtMs
+    );
+    const lowZ0ConfidenceRejected = Boolean(
+      qualityInputsReady
+      && absoluteZ0Score < THRESHOLDS.minimumAbsoluteZ0Score
+    );
+    const qualityAccepted = Boolean(
+      qualityInputsReady
+      && !slowThreeMatchWindowRejected
+      && !lowZ0ConfidenceRejected
+    );
+    const baseSignalMode = moderateAccepted
       ? "moderate"
       : marketSalvageAccepted
         ? "market-consensus"
         : "rejected";
-    const dataReady = metricsReady;
+    const signalMode = qualityAccepted ? baseSignalMode : "rejected";
+    const dataReady = metricsReady && qualityInputsReady;
     const eligible = dataReady && productionLeague;
-    const accepted = eligible && (moderateAccepted || marketSalvageAccepted);
+    const accepted = eligible
+      && qualityAccepted
+      && (moderateAccepted || marketSalvageAccepted);
     const inputHash = dataReady
       ? hashPayload({
           protocolId: PROTOCOL.id,
@@ -357,6 +385,12 @@
           relativeAgreementScore,
           latestPbpReversal,
           pointWindowSize,
+          collectionLatencyMs,
+          z0Score,
+          absoluteZ0Score,
+          slowThreeMatchWindowRejected,
+          lowZ0ConfidenceRejected,
+          qualityAccepted,
           leagueClass,
           left,
           right,
@@ -372,7 +406,10 @@
     else if (baseSelectedSideIndex === null) reason = "collapse-selected-side-missing";
     else if (!windowReady) reason = "collapse-common-window-missing";
     else if (!metricsReady) reason = "collapse-metrics-missing";
+    else if (!qualityInputsReady) reason = "production-quality-inputs-missing";
     else if (leagueClass === "blocked") reason = "collapse-league-blocked";
+    else if (slowThreeMatchWindowRejected) reason = "production-slow-three-match-window-rejected";
+    else if (lowZ0ConfidenceRejected) reason = "production-low-z0-confidence-rejected";
     else if (shadowOnly) reason = "tt-cup-shadow-only";
     else if (accepted && !moderateAccepted && marketSalvageAccepted) reason = "production-market-consensus-salvage-qualified";
     else if (formulaAccepted && rejectedByModerateTier) reason = "production-relative-agreement-rejected";
@@ -399,6 +436,13 @@
       formulaAccepted,
       moderateAccepted,
       rejectedByModerateTier,
+      qualityInputsReady,
+      collectionLatencyMs: round(collectionLatencyMs, 3),
+      z0Score: round(z0Score),
+      absoluteZ0Score: round(absoluteZ0Score),
+      slowThreeMatchWindowRejected,
+      lowZ0ConfidenceRejected,
+      qualityAccepted,
       signalMode,
       accepted,
       reason,

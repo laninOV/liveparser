@@ -1043,7 +1043,9 @@ function buildCurrentForecastView(archive) {
     latestPbpReversal: selection.sideCorrection && selection.sideCorrection.latestReversal,
     leagueName,
     moneylineMarket,
-    decisionAt
+    decisionAt,
+    collectionLatencyMs: Number(archive && archive.collectionLatencyMs),
+    z0Score: selection.z0Score
   });
   const finalSideIndex = pair.selectedSideIndex === 0
     || pair.selectedSideIndex === 1
@@ -1053,7 +1055,10 @@ function buildCurrentForecastView(archive) {
     pair.moderateAccepted === true || pair.marketSalvageAccepted === true
   );
   const productionAccepted = pair && pair.accepted === true;
-  const shadowAccepted = formulaAccepted && pair && pair.shadowOnly === true;
+  const shadowAccepted = formulaAccepted
+    && pair
+    && pair.shadowOnly === true
+    && pair.qualityAccepted === true;
   const player = players[finalSideIndex] && players[finalSideIndex].name || `#${finalSideIndex + 1}`;
   const label = productionAccepted
     ? "Прогноз · боевой фильтр"
@@ -1316,6 +1321,12 @@ function buildArchiveGamesCsv(rows) {
     "signalMode",
     "pbpFilterAccepted",
     "pbpPointWindow",
+    "qualityInputsReady",
+    "collectionLatencyMs",
+    "absoluteZ0Score",
+    "slowThreeMatchWindowRejected",
+    "lowZ0ConfidenceRejected",
+    "qualityAccepted",
     "pairBaseSelectedSideIndex",
     "marketReady",
     "marketReason",
@@ -1427,6 +1438,24 @@ function buildArchiveGamesCsv(rows) {
       signalMode: features.startMatchSignalMode || prematch.signalMode || "",
       pbpFilterAccepted: isCurrentCollapseGate ? features.startMatchPairRegimeModerateAccepted ?? "" : "",
       pbpPointWindow: isCurrentCollapseGate ? features.startMatchPairRegimePointWindowSize ?? "" : "",
+      qualityInputsReady: isCurrentCollapseGate
+        ? features.startMatchPairRegimeQualityInputsReady ?? ""
+        : "",
+      collectionLatencyMs: isCurrentCollapseGate
+        ? features.startMatchPairRegimeCollectionLatencyMs ?? prematch.collectionLatencyMs ?? ""
+        : prematch.collectionLatencyMs ?? "",
+      absoluteZ0Score: isCurrentCollapseGate
+        ? features.startMatchPairRegimeAbsoluteZ0Score ?? ""
+        : "",
+      slowThreeMatchWindowRejected: isCurrentCollapseGate
+        ? features.startMatchPairRegimeSlowThreeMatchWindowRejected ?? ""
+        : "",
+      lowZ0ConfidenceRejected: isCurrentCollapseGate
+        ? features.startMatchPairRegimeLowZ0ConfidenceRejected ?? ""
+        : "",
+      qualityAccepted: isCurrentCollapseGate
+        ? features.startMatchPairRegimeQualityAccepted ?? ""
+        : "",
       pairBaseSelectedSideIndex: isCurrentCollapseGate
         ? features.startMatchPairRegimeBaseSelectedSideIndex ?? ""
         : "",

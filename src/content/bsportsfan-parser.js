@@ -3381,6 +3381,8 @@
         currentSnapshot.oddsMarket = archive.targetOdds;
       }
     }
+    archive.readyAt = Date.now();
+    archive.collectionLatencyMs = Math.max(0, archive.readyAt - collectionStartedAt);
     archive.forecast = buildArchiveCurrentForecastSummary(archive);
     notify("Подсчет готов", archive, archive.candidateCount, formatArchiveProgressLines(archive));
     return archive;
@@ -6469,6 +6471,7 @@
     archive.deliveryEntryState = deliveryEntryState;
     archive.deliveryMode = deliveryEntryState.mode;
     archive.collectionLatencyMs = Math.max(0, readyAt - Number(archive.collectionStartedAt || readyAt));
+    archive.forecast = buildArchiveCurrentForecastSummary(archive);
   }
 
   function buildCurrentCipListRowSnapshot(matchUrl) {
@@ -8257,7 +8260,9 @@
           latestPbpReversal: evaluation.sideCorrection && evaluation.sideCorrection.latestReversal,
           leagueName: telegramContext.leagueName,
           moneylineMarket: frozenMoneylineMarket,
-          decisionAt: finalDecisionAt
+          decisionAt: finalDecisionAt,
+          collectionLatencyMs: finiteNumberOrNull(context && context.collectionLatencyMs),
+          z0Score: finiteNumberOrNull(evaluation.z0Score)
         })
       : {
           protocolId: MATCH_START_PAIR_PROTOCOL.id || "",
@@ -8290,6 +8295,13 @@
           marketSideOverrideApplied: false,
           marketSalvageAccepted: false,
           marketSnapshot: frozenMoneylineMarket,
+          qualityInputsReady: false,
+          collectionLatencyMs: finiteNumberOrNull(context && context.collectionLatencyMs),
+          z0Score: finiteNumberOrNull(evaluation.z0Score),
+          absoluteZ0Score: null,
+          slowThreeMatchWindowRejected: false,
+          lowZ0ConfidenceRejected: false,
+          qualityAccepted: false,
           sumWithinLimit: false,
           countsUnequal: false
         };
@@ -8473,6 +8485,12 @@
       startMatchPairRegimeEligible: pairRegime.eligible ? 1 : 0,
       startMatchPairRegimeFormulaAccepted: pairRegime.formulaAccepted ? 1 : 0,
       startMatchPairRegimeModerateAccepted: pairRegime.moderateAccepted ? 1 : 0,
+      startMatchPairRegimeQualityInputsReady: pairRegime.qualityInputsReady ? 1 : 0,
+      startMatchPairRegimeCollectionLatencyMs: finiteNumberOrNull(pairRegime.collectionLatencyMs) ?? "",
+      startMatchPairRegimeAbsoluteZ0Score: finiteNumberOrNull(pairRegime.absoluteZ0Score) ?? "",
+      startMatchPairRegimeSlowThreeMatchWindowRejected: pairRegime.slowThreeMatchWindowRejected ? 1 : 0,
+      startMatchPairRegimeLowZ0ConfidenceRejected: pairRegime.lowZ0ConfidenceRejected ? 1 : 0,
+      startMatchPairRegimeQualityAccepted: pairRegime.qualityAccepted ? 1 : 0,
       startMatchSignalMode: pairRegime.signalMode || "rejected",
       startMatchPairRegimeAccepted: pairRegime.accepted ? 1 : 0,
       startMatchPairRegimeLeftCollapseCount: finiteNumberOrNull(pairRegime.leftCollapseCount) ?? "",
@@ -8567,6 +8585,7 @@
     const shadowQualified = Boolean(
       modelReady
       && pairRegime.shadowOnly
+      && pairRegime.qualityAccepted
       && (pairRegime.moderateAccepted || pairRegime.marketSalvageAccepted)
     );
     const message = !evaluation.eligible

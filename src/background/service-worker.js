@@ -5839,7 +5839,9 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
     latestPbpReversal: evaluation.sideCorrection && evaluation.sideCorrection.latestReversal,
     leagueName,
     moneylineMarket: source && source.referenceMoneylineMarket || null,
-    decisionAt
+    decisionAt,
+    collectionLatencyMs: finitePredictionDatasetNumber(source && source.collectionLatencyMs),
+    z0Score: evaluation.z0Score
   });
   const expectedSide = pairRegime.selectedSideIndex;
   const decisionInputHash = pairRegime.inputHash;
@@ -6010,6 +6012,20 @@ function validateTelegramMatchStartPrediction(source, features = {}, detailsFeat
     || readNumber("startMatchPairRegimeEligible") !== (pairRegime.eligible ? 1 : 0)
     || readNumber("startMatchPairRegimeFormulaAccepted") !== (pairRegime.formulaAccepted ? 1 : 0)
     || readNumber("startMatchPairRegimeModerateAccepted") !== (pairRegime.moderateAccepted ? 1 : 0)
+    || readNumber("startMatchPairRegimeQualityInputsReady") !== (pairRegime.qualityInputsReady ? 1 : 0)
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeCollectionLatencyMs"),
+      pairRegime.collectionLatencyMs
+    )
+    || !telegramPairRegimeOptionalNumbersEqual(
+      readNumber("startMatchPairRegimeAbsoluteZ0Score"),
+      pairRegime.absoluteZ0Score
+    )
+    || readNumber("startMatchPairRegimeSlowThreeMatchWindowRejected")
+      !== (pairRegime.slowThreeMatchWindowRejected ? 1 : 0)
+    || readNumber("startMatchPairRegimeLowZ0ConfidenceRejected")
+      !== (pairRegime.lowZ0ConfidenceRejected ? 1 : 0)
+    || readNumber("startMatchPairRegimeQualityAccepted") !== (pairRegime.qualityAccepted ? 1 : 0)
     || readText("startMatchSignalMode") !== pairRegime.signalMode
     || readNumber("startMatchPairRegimeAccepted") !== (pairRegime.accepted ? 1 : 0)
     || !telegramPairRegimeOptionalNumbersEqual(
@@ -6421,6 +6437,12 @@ function sanitizeTelegramPredictionFeatures(features) {
     "startMatchPairRegimeEligible",
     "startMatchPairRegimeFormulaAccepted",
     "startMatchPairRegimeModerateAccepted",
+    "startMatchPairRegimeQualityInputsReady",
+    "startMatchPairRegimeCollectionLatencyMs",
+    "startMatchPairRegimeAbsoluteZ0Score",
+    "startMatchPairRegimeSlowThreeMatchWindowRejected",
+    "startMatchPairRegimeLowZ0ConfidenceRejected",
+    "startMatchPairRegimeQualityAccepted",
     "startMatchPairRegimeAccepted",
     "startMatchPairRegimeLeftCollapseCount",
     "startMatchPairRegimeRightCollapseCount",
@@ -7668,6 +7690,8 @@ function summarizeTelegramStartPairRegimeRows(rows, leagueScope = "production") 
   const strongSelectedStrengthException = buildTelegramPairRegimeStatsBucket();
   const selectedHistorySetShareException = buildTelegramPairRegimeStatsBucket();
   const relativeFormSetShareException = buildTelegramPairRegimeStatsBucket();
+  const slowThreeMatchWindowRejected = buildTelegramPairRegimeStatsBucket();
+  const lowZ0ConfidenceRejected = buildTelegramPairRegimeStatsBucket();
   for (const candidate of cohort) {
     addTelegramPairRegimeStatsBucket(baseline, candidate);
     addTelegramPairRegimeStatsBucket(
@@ -7680,6 +7704,12 @@ function summarizeTelegramStartPairRegimeRows(rows, leagueScope = "production") 
     if (candidate.sumWithinLimit) addTelegramPairRegimeStatsBucket(sumWithinLimit, candidate);
     if (candidate.countsUnequal) addTelegramPairRegimeStatsBucket(countsUnequal, candidate);
     if (candidate.collapseAccepted) addTelegramPairRegimeStatsBucket(collapseAccepted, candidate);
+    if (candidate.slowThreeMatchWindowRejected) {
+      addTelegramPairRegimeStatsBucket(slowThreeMatchWindowRejected, candidate);
+    }
+    if (candidate.lowZ0ConfidenceRejected) {
+      addTelegramPairRegimeStatsBucket(lowZ0ConfidenceRejected, candidate);
+    }
     if (!candidate.collapseAccepted && candidate.strongSelectedStrengthException) {
       addTelegramPairRegimeStatsBucket(strongSelectedStrengthException, candidate);
     }
@@ -7709,7 +7739,9 @@ function summarizeTelegramStartPairRegimeRows(rows, leagueScope = "production") 
     collapseAccepted,
     strongSelectedStrengthException,
     selectedHistorySetShareException,
-    relativeFormSetShareException
+    relativeFormSetShareException,
+    slowThreeMatchWindowRejected,
+    lowZ0ConfidenceRejected
   ]) {
     finishTelegramPairRegimeStatsBucket(bucket, cohort.length);
   }
@@ -7748,7 +7780,9 @@ function summarizeTelegramStartPairRegimeRows(rows, leagueScope = "production") 
     collapseAccepted,
     strongSelectedStrengthException,
     selectedHistorySetShareException,
-    relativeFormSetShareException
+    relativeFormSetShareException,
+    slowThreeMatchWindowRejected,
+    lowZ0ConfidenceRejected
   };
 }
 
@@ -7791,7 +7825,10 @@ function parseTelegramStartPairRegimeRow(row) {
     collapseAccepted: false,
     strongSelectedStrengthException: false,
     selectedHistorySetShareException: false,
-    relativeFormSetShareException: false
+    relativeFormSetShareException: false,
+    qualityAccepted: false,
+    slowThreeMatchWindowRejected: false,
+    lowZ0ConfidenceRejected: false
   };
   if (!["production", "tt-cup-shadow"].includes(leagueMode)) {
     return { ...base, reason: "pair-regime-league-mode-invalid" };
@@ -7829,13 +7866,18 @@ function parseTelegramStartPairRegimeRow(row) {
     latestPbpReversal: evaluation.sideCorrection && evaluation.sideCorrection.latestReversal,
     leagueName,
     moneylineMarket: prematch.referenceMoneylineMarket || null,
-    decisionAt: base.decisionAt
+    decisionAt: base.decisionAt,
+    collectionLatencyMs: finitePredictionDatasetNumber(prematch.collectionLatencyMs),
+    z0Score: evaluation.z0Score
   });
   const decisionInputHash = pairRegime.inputHash;
   const expectedSide = pairRegime.selectedSideIndex;
   base.eligible = pairRegime.dataReady === true;
-  base.pairAccepted = pairRegime.moderateAccepted === true
-    || pairRegime.marketSalvageAccepted === true;
+  base.pairAccepted = pairRegime.qualityAccepted === true
+    && (
+      pairRegime.moderateAccepted === true
+      || pairRegime.marketSalvageAccepted === true
+    );
   base.signalMode = pairRegime.signalMode;
   base.sumWithinLimit = pairRegime.sumWithinLimit === true;
   base.countsUnequal = pairRegime.countsUnequal === true;
@@ -7843,6 +7885,9 @@ function parseTelegramStartPairRegimeRow(row) {
   base.strongSelectedStrengthException = pairRegime.strongSelectedStrengthException === true;
   base.selectedHistorySetShareException = pairRegime.selectedHistorySetShareException === true;
   base.relativeFormSetShareException = pairRegime.relativeFormSetShareException === true;
+  base.qualityAccepted = pairRegime.qualityAccepted === true;
+  base.slowThreeMatchWindowRejected = pairRegime.slowThreeMatchWindowRejected === true;
+  base.lowZ0ConfidenceRejected = pairRegime.lowZ0ConfidenceRejected === true;
   const expectedMode = pairRegime.shadowOnly ? "tt-cup-shadow" : "production";
   const storedSide = sanitizeCalibrationSideIndex(prematch.sideIndex);
   const decisionAction = readTelegramPrematchFeatureText(
@@ -7897,6 +7942,22 @@ function parseTelegramStartPairRegimeRow(row) {
       === (pairRegime.formulaAccepted ? 1 : 0)
     && readTelegramPrematchFeatureNumber(features.startMatchPairRegimeModerateAccepted)
       === (pairRegime.moderateAccepted ? 1 : 0)
+    && readTelegramPrematchFeatureNumber(features.startMatchPairRegimeQualityInputsReady)
+      === (pairRegime.qualityInputsReady ? 1 : 0)
+    && telegramPairRegimeOptionalNumbersEqual(
+      readTelegramPrematchFeatureNumber(features.startMatchPairRegimeCollectionLatencyMs),
+      pairRegime.collectionLatencyMs
+    )
+    && telegramPairRegimeOptionalNumbersEqual(
+      readTelegramPrematchFeatureNumber(features.startMatchPairRegimeAbsoluteZ0Score),
+      pairRegime.absoluteZ0Score
+    )
+    && readTelegramPrematchFeatureNumber(features.startMatchPairRegimeSlowThreeMatchWindowRejected)
+      === (pairRegime.slowThreeMatchWindowRejected ? 1 : 0)
+    && readTelegramPrematchFeatureNumber(features.startMatchPairRegimeLowZ0ConfidenceRejected)
+      === (pairRegime.lowZ0ConfidenceRejected ? 1 : 0)
+    && readTelegramPrematchFeatureNumber(features.startMatchPairRegimeQualityAccepted)
+      === (pairRegime.qualityAccepted ? 1 : 0)
     && readTelegramPrematchFeatureText(features.startMatchSignalMode) === pairRegime.signalMode
     && readTelegramPrematchFeatureNumber(features.startMatchPairRegimeAccepted)
       === (pairRegime.accepted ? 1 : 0)
