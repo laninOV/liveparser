@@ -1769,7 +1769,7 @@ function delay(ms) {
 function isBsportsfanUrl(value) {
   try {
     const url = new URL(value || "");
-    return /(^|\.)bsportsfan\.com$/i.test(url.hostname);
+    return /(^|\.)(?:bsportsfan|betsapi)\.com$/i.test(url.hostname);
   } catch (_) {
     return false;
   }

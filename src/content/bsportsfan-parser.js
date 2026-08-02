@@ -13,18 +13,22 @@
     "a[href^='/r/']",
     "a[href^='/rs/']",
     "a[href*='bsportsfan.com/r/']",
-    "a[href*='bsportsfan.com/rs/']"
+    "a[href*='bsportsfan.com/rs/']",
+    "a[href*='betsapi.com/r/']",
+    "a[href*='betsapi.com/rs/']"
   ].join(",");
   const BSF_PLAYER_LINK_SELECTOR = [
     "a[href*='/table-tennis/t/']",
     "a[href^='/t/']",
-    "a[href*='bsportsfan.com/t/']"
+    "a[href*='bsportsfan.com/t/']",
+    "a[href*='betsapi.com/t/']"
   ].join(",");
   const BSF_LIST_MATCH_ROW_SELECTOR = "tr, .card-hover, li";
   const UPDATE_INTERVAL_MS = 5000;
   const HIDDEN_LIST_UPDATE_INTERVAL_MS = 5000;
   const CIP_TABLE_TENNIS_AUTO_RELOAD_PATH = "/cip/table-tennis";
   const TABLE_TENNIS_CATEGORY_PATH = "/c/table-tennis";
+  const BETSAPI_TABLE_TENNIS_ORIGIN = "https://betsapi.com";
   const MUTATION_DELAY_MS = 250;
   const MUTATION_MIN_UPDATE_INTERVAL_MS = 3000;
   const ARCHIVE_MATCHES_PER_PLAYER = 5;
@@ -145,6 +149,7 @@
   let playerMatchesCacheLoaded = false;
   let playerMatchesCachePersistTimer = 0;
   let visibleChallengeRetryTimer = 0;
+  let betsapiFailoverStarted = false;
   let prematchPointCacheLoaded = false;
   let prematchPointCachePersistTimer = 0;
   let prematchPointFetchActive = 0;
@@ -164,10 +169,11 @@
   let lastSnapshotKey = "";
   let lastStatusReportTs = 0;
 
-  whenDocumentReady(() => {
+  whenDocumentReady(async () => {
     clearLegacyTelegramPredictionResultCrawlerState();
     installProductionBridge();
     installRuntimeListener();
+    await prepareTableTennisDataSourceBeforeCollection();
     installLiveSessionRecovery();
     installMutationObserver();
     installCipTableTennisAutoReload();
@@ -175,6 +181,21 @@
     updateSnapshot("ready");
     window.setInterval(() => updateSnapshot("interval"), UPDATE_INTERVAL_MS);
   });
+
+  async function prepareTableTennisDataSourceBeforeCollection() {
+    if (
+      !isBetsapiDataHostname(location.hostname)
+      || isBsportsfanDocumentChallenge(document)
+    ) {
+      return;
+    }
+    const response = await sendRuntimeMessage({
+      type: "lvr:reportBsportsfanHealthy",
+      observedAt: Date.now(),
+      url: normalizeUrl(location.href)
+    }).catch(() => null);
+    visibleHealthyReported = Boolean(response && response.healthy);
+  }
 
   function clearLegacyTelegramPredictionResultCrawlerState() {
     try {
@@ -254,6 +275,9 @@
   function beginLiveSessionRecovery(toast = null, reason = "live-session-expired") {
     if (liveSessionRecoveryStarted || !isBsportsfanTableTennisPage()) {
       return false;
+    }
+    if (scheduleBetsapiFailover(reason)) {
+      return true;
     }
     liveSessionRecoveryStarted = true;
     inlineAutoForecastQueue.clear();
@@ -530,7 +554,7 @@
     const path = normalizeCipTableTennisAutoReloadPath(url && url.pathname);
     return Boolean(url
       && url.protocol === "https:"
-      && url.hostname === "ru.bsportsfan.com"
+      && isSupportedTableTennisDataHostname(url.hostname)
       && [CIP_TABLE_TENNIS_AUTO_RELOAD_PATH, TABLE_TENNIS_CATEGORY_PATH].includes(path)
       && !url.search);
   }
@@ -956,7 +980,7 @@
         }
       }, BSPORTSFAN_VISIBLE_CHALLENGE_RETRY_MS);
     }
-    if (firstObservation) {
+    if (firstObservation && !scheduleBetsapiFailover("visible-security-challenge")) {
       notifyBsportsfanAttention("security-challenge");
     }
     return true;
@@ -3453,7 +3477,7 @@
             getTelegramPredictionDatasetRowCreatedAt(left)
             - getTelegramPredictionDatasetRowCreatedAt(right)
           ))
-          .map((row) => normalizeMatchUrlKey(row && row.matchUrl || ""))
+          .map((row) => rebaseTableTennisDataUrl(row && row.matchUrl || ""))
           .filter(Boolean);
         const recovery = config.force === true && recoveryUrls.length
           ? await sendRuntimeMessage({
@@ -3692,8 +3716,9 @@
           break;
         }
         const matchUrl = normalizeUrl(row && row.matchUrl || "");
+        const sourceMatchUrl = rebaseTableTennisDataUrl(matchUrl);
         try {
-          const market = await fetchBsportsfanOddsMarket(matchUrl, {
+          const market = await fetchBsportsfanOddsMarket(sourceMatchUrl, {
             matchDateTs: getTelegramPredictionHistoricalMatchDateTs(row),
             requestPriority: "background",
             allowIframe: true
@@ -4190,7 +4215,9 @@
       return [];
     }
     const matchUrl = parseUrl(row && row.matchUrl || "");
-    const origin = matchUrl && matchUrl.origin || location.origin;
+    const origin = isSupportedTableTennisDataHostname(location.hostname)
+      ? location.origin
+      : matchUrl && matchUrl.origin || location.origin;
     return players.map((name, index) => ({
       name,
       id: playerIds[index],
@@ -4218,9 +4245,13 @@
     if (!matchUrl) {
       return null;
     }
+    const sourceMatchUrl = rebaseTableTennisDataUrl(matchUrl);
+    const sourceRow = sourceMatchUrl === matchUrl
+      ? row
+      : { ...row, matchUrl: sourceMatchUrl };
     if (options.allowIframe !== false) {
       try {
-        const frameResult = await loadTelegramPredictionFinalResultInFrame(row, {
+        const frameResult = await loadTelegramPredictionFinalResultInFrame(sourceRow, {
           ...options,
           deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS
         });
@@ -4233,7 +4264,7 @@
         }
       }
     }
-    const html = await fetchText(matchUrl, {
+    const html = await fetchText(sourceMatchUrl, {
       cacheTtlMs: 1,
       deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS,
       requestPriority: options.requestPriority || "background"
@@ -4241,7 +4272,7 @@
     const doc = new DOMParser().parseFromString(html, "text/html");
     return parseTelegramPredictionFinalResultDocument(
       doc,
-      matchUrl,
+      sourceMatchUrl,
       row,
       "match-page-backfill"
     );
@@ -5966,6 +5997,9 @@
     } catch (error) {
       if (!isInlineForecastRunCurrent(matchUrl, runId)) {
         return;
+      }
+      if (isBsportsfanProtectionError(error)) {
+        scheduleBetsapiFailover(normalizeText(error && error.code || "bsportsfan-protection"));
       }
       const archive = buildInlineForecastFailureArchive(matchUrl, options.seedSnapshot, error, collectionStartedAt);
       const retryable = isRetryableInlineForecastError(error);
@@ -10031,6 +10065,8 @@
     }).catch((error) => {
       if (isBsportsfanLiveSessionExpiredError(error)) {
         beginLiveSessionRecovery(null, "fetch-live-session-expired");
+      } else if (isBsportsfanProtectionError(error)) {
+        scheduleBetsapiFailover(normalizeText(error && error.code || "bsportsfan-protection"));
       }
       throw error;
     }).finally(() => {
@@ -10124,6 +10160,7 @@
       observedAt: Date.now(),
       url: normalizeUrl(location.href)
     }).catch(() => {});
+    scheduleBetsapiFailover(normalizeText(error && error.code || "security-challenge"));
   }
 
   function getBsportsfanNavigationProtectionError(now = Date.now()) {
@@ -10906,13 +10943,74 @@
     }
   }
 
+  function isOriginalBsportsfanDataHostname(value) {
+    const hostname = String(value || "").toLowerCase();
+    return hostname === "bsportsfan.com" || hostname.endsWith(".bsportsfan.com");
+  }
+
+  function isBetsapiDataHostname(value) {
+    const hostname = String(value || "").toLowerCase();
+    return hostname === "betsapi.com" || hostname.endsWith(".betsapi.com");
+  }
+
+  function isSupportedTableTennisDataHostname(value) {
+    return isOriginalBsportsfanDataHostname(value) || isBetsapiDataHostname(value);
+  }
+
+  function rebaseTableTennisDataUrl(value, targetOrigin = location.origin) {
+    const url = parseUrl(value);
+    const target = parseUrl(targetOrigin);
+    if (
+      !url
+      || !target
+      || !isSupportedTableTennisDataHostname(url.hostname)
+      || !isSupportedTableTennisDataHostname(target.hostname)
+    ) {
+      return normalizeUrl(value);
+    }
+    url.protocol = target.protocol;
+    url.host = target.host;
+    return normalizeUrl(url.href);
+  }
+
+  function scheduleBetsapiFailover(reason = "bsportsfan-protection") {
+    if (
+      betsapiFailoverStarted
+      || !isOriginalBsportsfanDataHostname(location.hostname)
+      || !isBsportsfanTableTennisPage()
+    ) {
+      return false;
+    }
+    betsapiFailoverStarted = true;
+    inlineAutoForecastQueue.clear();
+    const target = new URL(location.href);
+    target.protocol = "https:";
+    target.host = new URL(BETSAPI_TABLE_TENNIS_ORIGIN).host;
+    target.hash = "";
+    target.search = "";
+    if (isBsportsfanTableTennisListPage()) {
+      target.pathname = CIP_TABLE_TENNIS_AUTO_RELOAD_PATH;
+    }
+    recordTelegramSendDebug("data-source-failover", normalizeUrl(location.href), {
+      ok: true,
+      sent: false,
+      quiet: true,
+      reason: normalizeText(reason || "bsportsfan-protection"),
+      target: target.href
+    });
+    window.setTimeout(() => {
+      window.location.replace(target.href);
+    }, 400);
+    return true;
+  }
+
   function parseInteger(value) {
     const match = normalizeText(value).match(/^-?\d+$/);
     return match ? Number(match[0]) : null;
   }
 
   function isBsportsfanTableTennisPage() {
-    return /(^|\.)bsportsfan\.com$/i.test(location.hostname || "")
+    return isSupportedTableTennisDataHostname(location.hostname)
       && (
         /\/(?:c|cip|ce|cs)\/table[-_]?tennis(?:\/|$)/i.test(location.pathname || "")
         || /\/(?:table-tennis\/)?(?:rs?|t)\/\d+/i.test(location.pathname || "")
@@ -10920,7 +11018,7 @@
   }
 
   function isBsportsfanTableTennisListPage() {
-    return /(^|\.)bsportsfan\.com$/i.test(location.hostname || "")
+    return isSupportedTableTennisDataHostname(location.hostname)
       && /\/(?:c|cip|ce|cs)\/table[-_]?tennis(?:\/|$)/i.test(location.pathname || "");
   }
 
@@ -10929,12 +11027,12 @@
     const path = normalizeCipTableTennisAutoReloadPath(url && url.pathname);
     return Boolean(url
       && url.protocol === "https:"
-      && url.hostname === "ru.bsportsfan.com"
+      && isSupportedTableTennisDataHostname(url.hostname)
       && [CIP_TABLE_TENNIS_AUTO_RELOAD_PATH, TABLE_TENNIS_CATEGORY_PATH].includes(path));
   }
 
   function isBsportsfanTableTennisResultsPage(doc = document) {
-    return /(^|\.)bsportsfan\.com$/i.test(location.hostname || "")
+    return isSupportedTableTennisDataHostname(location.hostname)
       && (
         String(location.pathname || "").startsWith(RESULTS_PATH)
         || isBsportsfanTableTennisListPage() && hasActiveBsportsfanResultsTab(doc)
@@ -10982,7 +11080,7 @@
   function isBsportsfanTableTennisListUrl(value) {
     const url = parseUrl(value);
     return Boolean(url
-      && /(^|\.)bsportsfan\.com$/i.test(url.hostname)
+      && isSupportedTableTennisDataHostname(url.hostname)
       && /\/(?:cip|ce)\/table-tennis(?:\/|$)/i.test(url.pathname));
   }
 
@@ -10990,7 +11088,7 @@
     const url = parseUrl(value);
     return Boolean(
       url
-      && /(^|\.)bsportsfan\.com$/i.test(url.hostname)
+      && isSupportedTableTennisDataHostname(url.hostname)
       && /\/(?:table-tennis\/)?t\/\d+/i.test(url.pathname)
     );
   }
@@ -10999,7 +11097,7 @@
     const url = parseUrl(value);
     return Boolean(
       url
-      && /(^|\.)bsportsfan\.com$/i.test(url.hostname)
+      && isSupportedTableTennisDataHostname(url.hostname)
       && /\/(?:table-tennis\/)?rs?\/\d+/i.test(url.pathname)
     );
   }
@@ -11014,14 +11112,14 @@
     const url = parseUrl(value);
     return Boolean(
       url
-      && /(^|\.)bsportsfan\.com$/i.test(url.hostname)
+      && isSupportedTableTennisDataHostname(url.hostname)
       && /\/(?:table-tennis\/)?r\/\d+/i.test(url.pathname)
     );
   }
 
   function getBsportsfanOddsUrl(value) {
     const url = parseUrl(value);
-    if (!url || !/(^|\.)bsportsfan\.com$/i.test(url.hostname)) {
+    if (!url || !isSupportedTableTennisDataHostname(url.hostname)) {
       return "";
     }
     if (/\/(?:table-tennis\/)?rs\//i.test(url.pathname)) {

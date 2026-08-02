@@ -277,13 +277,20 @@ async function runBsportsfanHealthWatchdog(now = Date.now()) {
     return { reloaded: false, reason: "tabs-unavailable" };
   }
   const tabs = await chrome.tabs.query({
-    url: ["https://bsportsfan.com/*", "https://*.bsportsfan.com/*"]
+    url: [
+      "https://bsportsfan.com/*",
+      "https://*.bsportsfan.com/*",
+      "https://betsapi.com/*",
+      "https://*.betsapi.com/*"
+    ]
   }).catch(() => []);
   const candidates = (Array.isArray(tabs) ? tabs : [])
     .filter((tab) => Number.isInteger(tab && tab.id))
     .sort((left, right) => {
       const listRank = (tab) => /\/(?:cip|c)\/table-tennis\/?(?:[?#]|$)/i.test(String(tab && tab.url || "")) ? 0 : 1;
+      const sourceRank = (tab) => /https:\/\/(?:[^/]+\.)?betsapi\.com\//i.test(String(tab && tab.url || "")) ? 0 : 1;
       return listRank(left) - listRank(right)
+        || sourceRank(left) - sourceRank(right)
         || Number(Boolean(right && right.active)) - Number(Boolean(left && left.active));
     });
   const tab = candidates[0];
@@ -1642,6 +1649,14 @@ function isBsportsfanLiveSessionExpiredResponse(value) {
   );
 }
 
+function isSupportedTableTennisDataHostname(value) {
+  const hostname = String(value || "").toLowerCase();
+  return hostname === "bsportsfan.com"
+    || hostname.endsWith(".bsportsfan.com")
+    || hostname === "betsapi.com"
+    || hostname.endsWith(".betsapi.com");
+}
+
 function validateBsportsfanProxyRequest(value, sender) {
   let url;
   try {
@@ -1652,7 +1667,7 @@ function validateBsportsfanProxyRequest(value, sender) {
   const hostname = url.hostname.toLowerCase();
   if (
     url.protocol !== "https:"
-    || hostname !== "bsportsfan.com" && !hostname.endsWith(".bsportsfan.com")
+    || !isSupportedTableTennisDataHostname(hostname)
     || url.username
     || url.password
     || !isAllowedBsportsfanProxyPath(url.pathname)
@@ -1686,7 +1701,7 @@ function validateBsportsfanProxySender(sender) {
   const hostname = parsed.hostname.toLowerCase();
   if (
     parsed.protocol !== "https:"
-    || hostname !== "bsportsfan.com" && !hostname.endsWith(".bsportsfan.com")
+    || !isSupportedTableTennisDataHostname(hostname)
   ) {
     throw createServiceWorkerError("untrusted BsportsFan proxy sender", "bsportsfan-sender");
   }
@@ -1702,7 +1717,7 @@ function validateBsportsfanProxyFinalUrl(value) {
   const hostname = url.hostname.toLowerCase();
   if (
     url.protocol !== "https:"
-    || hostname !== "bsportsfan.com" && !hostname.endsWith(".bsportsfan.com")
+    || !isSupportedTableTennisDataHostname(hostname)
     || !isAllowedBsportsfanProxyPath(url.pathname)
   ) {
     throw createServiceWorkerError("BsportsFan redirected outside the allowed route", "bsportsfan-redirect");
@@ -1840,7 +1855,9 @@ async function reloadBsportsfanTabsAfterExtensionUpgrade(previousVersion, force 
   const tabs = await chrome.tabs.query({
     url: [
       "https://bsportsfan.com/*",
-      "https://*.bsportsfan.com/*"
+      "https://*.bsportsfan.com/*",
+      "https://betsapi.com/*",
+      "https://*.betsapi.com/*"
     ]
   }).catch(() => []);
   const reloadableTabs = (Array.isArray(tabs) ? tabs : [])
@@ -1930,7 +1947,7 @@ async function startBsportsfanResultRecovery(values, sender) {
     const existing = candidatesByIdentity.get(identity);
     if (!existing || refTs > existing.ts) {
       candidatesByIdentity.set(identity, {
-        url: normalizeTelegramMatchKey(refUrl.href),
+        url: requestedByIdentity.get(identity),
         ts: refTs
       });
     }
