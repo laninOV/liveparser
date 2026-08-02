@@ -107,6 +107,8 @@ const BSPORTSFAN_RESULT_RECOVERY_MIN_AGE_MS = 20 * 60 * 1000;
 const TABLE_TENNIS_SOURCE_STATE_KEY = "tableTennisSourceStateV1";
 const TABLE_TENNIS_PRIMARY_SOURCE_ID = "betsapi";
 const TABLE_TENNIS_SOURCE_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
+const TABLE_TENNIS_ENDPOINT_BLOCKED_CODE = "table-tennis-endpoint-blocked";
+const TABLE_TENNIS_ENDPOINT_BLOCKED_RETRY_MS = 5 * 60 * 1000;
 const TABLE_TENNIS_SOURCE_ORIGINS = Object.freeze({
   betsapi: "https://betsapi.com",
   bsportsfan: "https://ru.bsportsfan.com"
@@ -206,7 +208,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       code: String(error && error.code || ""),
       status: Number(error && error.status || 0) || 0,
       sourceId: normalizeTelegramText(error && error.sourceId || ""),
-      retryAfterMs: Math.max(0, Number(error && error.retryAfterMs || 0) || 0)
+      retryAfterMs: Math.max(0, Number(error && error.retryAfterMs || 0) || 0),
+      endpointBlocked: error && error.endpointBlocked === true
     }));
 
   return true;
@@ -1864,25 +1867,17 @@ async function fetchBsportsfanText(value, options = {}) {
       const protectionResponse = status === 403 || status === 429;
       const error = createServiceWorkerError(
         `HTTP ${status}`,
-        status === 429
-          ? "bsportsfan-rate-limited"
-          : status === 403
-            ? "bsportsfan-challenge"
-            : "bsportsfan-http"
+        protectionResponse
+          ? TABLE_TENNIS_ENDPOINT_BLOCKED_CODE
+          : "bsportsfan-http"
       );
       error.status = status;
       if (protectionResponse) {
-        openBsportsfanProtectionCircuit(
-          error.code,
-          status,
-          status === 403
-            ? BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS
-            : BSPORTSFAN_PROXY_REQUEST_RETRY_MS,
-          sourceId
-        );
-        error.retryAfterMs = status === 403
-          ? BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS
-          : BSPORTSFAN_PROXY_REQUEST_RETRY_MS;
+        // A blocked auxiliary profile/PBP request does not prove that the
+        // visible live page is unavailable. Let the collector try the twin
+        // source without shutting down or navigating away from a healthy page.
+        error.endpointBlocked = true;
+        error.retryAfterMs = TABLE_TENNIS_ENDPOINT_BLOCKED_RETRY_MS;
       }
       throw error;
     }
@@ -1890,17 +1885,12 @@ async function fetchBsportsfanText(value, options = {}) {
     const text = await readBoundedBsportsfanResponseText(response);
     if (isBsportsfanChallengeResponse(response, text)) {
       const error = createServiceWorkerError(
-        "BsportsFan returned a security challenge",
-        "bsportsfan-challenge"
+        "Table-tennis endpoint returned a security challenge",
+        TABLE_TENNIS_ENDPOINT_BLOCKED_CODE
       );
       error.status = Number(response.status || 0) || 0;
-      error.retryAfterMs = BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS;
-      openBsportsfanProtectionCircuit(
-        error.code,
-        error.status,
-        BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS,
-        sourceId
-      );
+      error.endpointBlocked = true;
+      error.retryAfterMs = TABLE_TENNIS_ENDPOINT_BLOCKED_RETRY_MS;
       throw error;
     }
     if (isBsportsfanLiveSessionExpiredResponse(text)) {
@@ -1909,7 +1899,8 @@ async function fetchBsportsfanText(value, options = {}) {
         "bsportsfan-session-expired"
       );
       error.status = Number(response.status || 0) || 0;
-      error.retryAfterMs = 0;
+      error.endpointBlocked = true;
+      error.retryAfterMs = TABLE_TENNIS_ENDPOINT_BLOCKED_RETRY_MS;
       throw error;
     }
     return {
