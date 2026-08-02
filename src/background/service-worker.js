@@ -5216,7 +5216,8 @@ function alignTelegramDatasetResultToRecord(record, score, result = {}) {
   const trustedScoreOrder = result && result.scoreOrderTrusted === true
     && [
       "direct-match-page",
-      "exact-player-page-match-row"
+      "exact-player-page-match-row",
+      "exact-result-row-match-link"
     ].includes(scoreOrderEvidence)
     && isSameTelegramMatch(record && record.matchUrl, result && result.matchUrl);
   if (trustedScoreOrder) {

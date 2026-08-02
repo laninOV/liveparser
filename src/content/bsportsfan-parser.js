@@ -72,9 +72,9 @@
   const FRESH_FORM3_WEIGHTS = [0.5, 0.3, 0.2];
   const ARCHIVE_MAX_CANDIDATE_URLS = 60;
   const RESULTS_PATH = "/ce/table-tennis/";
-  const TELEGRAM_RESULT_AUTO_BACKFILL_INITIAL_DELAY_MS = 2 * 60 * 1000;
+  const TELEGRAM_RESULT_AUTO_BACKFILL_INITIAL_DELAY_MS = 30 * 1000;
   const TELEGRAM_RESULT_PAGE_AUTO_BACKFILL_DELAY_MS = 5 * 1000;
-  const TELEGRAM_RESULT_AUTO_BACKFILL_INTERVAL_MS = 10 * 60 * 1000;
+  const TELEGRAM_RESULT_AUTO_BACKFILL_INTERVAL_MS = 5 * 60 * 1000;
   const TELEGRAM_RESULT_AUTO_BACKFILL_MIN_ROW_AGE_MS = 5 * 60 * 1000;
   const TELEGRAM_RESULT_AUTO_BACKFILL_LIMIT = 2;
   const TELEGRAM_RESULT_AUTO_BACKFILL_RETRY_MS = 15 * 60 * 1000;
@@ -3599,7 +3599,10 @@
   async function backfillTelegramPredictionResults(dataset, options = {}) {
     const rows = Array.isArray(dataset) ? dataset : [];
     const config = options && typeof options === "object" ? options : {};
-    const limit = Math.min(30, Math.max(1, Number(config.limit || 10) || 10));
+    // Stored scores do not create network traffic. Keep the cap large enough to
+    // repair an accumulated archive in one pass while the separately bounded
+    // network pool remains intentionally small.
+    const limit = Math.min(150, Math.max(1, Number(config.limit || 10) || 10));
     const delayMs = Math.max(0, Number(config.delayMs || 150) || 0);
     const verbose = config.verbose !== false;
     const candidates = rows
@@ -3941,7 +3944,7 @@
           || TELEGRAM_RESULT_AUTO_BACKFILL_LIMIT
       );
       const networkLimit = Math.min(
-        config.force ? 6 : 2,
+        config.force ? 8 : 2,
         config.force
           ? requestedLimit
           : Math.min(TELEGRAM_RESULT_AUTO_BACKFILL_LIMIT, requestedLimit)
@@ -3951,7 +3954,7 @@
         .sort(compareTelegramPredictionResultBackfillAge);
       const storedCandidates = eligibleCandidates
         .filter((row) => getStoredObservedFinalResultForBackfill(row))
-        .slice(0, 20);
+        .slice(0, 120);
       if (
         visibleSync
         && Object.prototype.hasOwnProperty.call(visibleSync, "visibleRows")
@@ -4095,6 +4098,11 @@
     const key = normalizeMatchUrlKey(matchUrl);
     if (!key) {
       return false;
+    }
+    // A previously observed exact-row score can be reconciled locally. Do not
+    // hold that repair behind the network retry cooldown or the row-age gate.
+    if (getStoredObservedFinalResultForBackfill(row)) {
+      return true;
     }
     const retryAt = Number(telegramResultAutoBackfillRetryAt.get(key) || 0);
     if (!config.force && config.retryFailed !== true && retryAt && now < retryAt) {
@@ -4540,6 +4548,8 @@
             players,
             playerIds,
             setScores,
+            scoreOrderTrusted: true,
+            scoreOrderEvidence: "exact-result-row-match-link",
             source
           }
         };
@@ -4662,7 +4672,12 @@
 
   function getStoredObservedFinalResultForBackfill(row) {
     const result = getPredictionDatasetFinalResult(row);
-    if (normalizeText(result && result.resultOrientation || "").toLowerCase() === "unresolved") {
+    const resultOrientation = normalizeText(result && result.resultOrientation || "").toLowerCase();
+    const resultSource = normalizeText(result && result.resultSource || "").toLowerCase();
+    const exactResultRowRepair = resultOrientation === "unresolved"
+      && ["results-page-backfill", "visible-results-sync"].includes(resultSource)
+      && Boolean(getBsportsfanMatchId(row && row.matchUrl || ""));
+    if (resultOrientation === "unresolved" && !exactResultRowRepair) {
       return null;
     }
     const finalScore = normalizeText(
@@ -4671,7 +4686,9 @@
       || ""
     );
     const parsedScore = parseFinishedScoreParts(finalScore);
-    const players = Array.isArray(result && result.observedPlayers)
+    const players = exactResultRowRepair
+      ? []
+      : Array.isArray(result && result.observedPlayers)
       ? result.observedPlayers.slice(0, 2).map(cleanName).filter(Boolean)
       : [];
     if (
@@ -4696,9 +4713,13 @@
       finalScore: `${parsedScore.left}-${parsedScore.right}`,
       players: players.length === 2 ? players : [],
       playerIds: Array.isArray(result && result.observedPlayerIds)
+        && !exactResultRowRepair
         ? result.observedPlayerIds.slice(0, 2).map((value) => String(value || ""))
         : [],
-      setScores
+      setScores,
+      scoreOrderTrusted: exactResultRowRepair,
+      scoreOrderEvidence: exactResultRowRepair ? "exact-result-row-match-link" : "",
+      source: exactResultRowRepair ? "stored-exact-result-row-repair" : resultSource
     };
   }
 

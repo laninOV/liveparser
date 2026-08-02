@@ -514,9 +514,9 @@ async function backfillArchiveResults() {
   await withArchiveButton(archiveBackfill, async () => {
     const value = await sendTelegramTabAction({
       action: "runResultAutoBackfill",
-      limit: 6,
+      limit: 8,
       minAgeMs: 0,
-      delayMs: 300
+      delayMs: 700
     });
     const summary = value && value.value || value || {};
     if (isBackfillRunning(summary)) {
