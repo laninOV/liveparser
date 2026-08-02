@@ -3790,12 +3790,6 @@
     ) {
       return { running: false, status: "passive-tab" };
     }
-    if (
-      !config.force
-      && hasUrgentProductionForecastWork()
-    ) {
-      return { running: false, status: "forecast-priority" };
-    }
     const lease = await sendRuntimeMessage({
       type: "lvr:acquireBsportsfanResultBackfillLease",
       ...getTableTennisCollectorMessageIdentity(),
@@ -3844,6 +3838,47 @@
       let dataset = initialResponse && Array.isArray(initialResponse.dataset)
         ? initialResponse.dataset
         : [];
+      if (!config.force && hasUrgentProductionForecastWork()) {
+        const localCandidates = dataset
+          .filter(isForecastResultBackfillCandidate)
+          .filter((row) => getStoredObservedFinalResultForBackfill(row))
+          .sort(compareTelegramPredictionResultBackfillAge)
+          .slice(0, 120);
+        if (!localCandidates.length) {
+          telegramResultAutoBackfillLastSummary = {
+            running: false,
+            status: "forecast-priority",
+            reason,
+            startedAt,
+            completedAt: Date.now(),
+            candidates: 0,
+            checked: 0,
+            updated: 0,
+            failed: 0
+          };
+          return telegramResultAutoBackfillLastSummary;
+        }
+        const localSummary = await backfillTelegramPredictionResults(localCandidates, {
+          limit: localCandidates.length,
+          delayMs: 0,
+          verbose: false,
+          preemptForForecasts: false,
+          requestPriority: "background",
+          shouldContinue,
+          requireCollector: runContext.requireCollector,
+          collectorIdentity: getTableTennisCollectorMessageIdentity()
+        });
+        updateTelegramPredictionResultAutoBackfillRetry(localSummary);
+        telegramResultAutoBackfillLastSummary = {
+          running: false,
+          status: "done-local",
+          reason,
+          startedAt,
+          completedAt: Date.now(),
+          ...localSummary
+        };
+        return telegramResultAutoBackfillLastSummary;
+      }
       let visibleSync = null;
       if (isBsportsfanTableTennisResultsPage()) {
         visibleSync = await syncVisibleTelegramPredictionResults({
