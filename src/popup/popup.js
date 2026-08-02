@@ -164,13 +164,14 @@ async function collectFromTab(tab, type) {
   try {
     return await sendTabMessage(tab.id, { type });
   } catch (error) {
-    if (!isBsportsfanUrl(tab.url)) {
+    if (!isTableTennisSourceUrl(tab.url)) {
       throw error;
     }
 
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       files: [
+        "src/shared/table-tennis-sources.js",
         "src/shared/pipeline-policy.js",
         "src/shared/start-match-rule.js",
         "src/shared/side-correction-guard.js",
@@ -341,7 +342,7 @@ function renderArchiveDashboard(rows, summary, pipelineStatus, scanStatus = null
     ["Игр в архиве", list.length],
     ["Стартовые кэфы", `${openingOddsRows}/${list.length}`],
     ["Всего итогов", resultRows],
-    ["Источники данных", formatBsportsfanNetworkStatus(pipelineStatus && pipelineStatus.bsportsfanNetwork)]
+    ["Источники данных", formatTableTennisNetworkStatus(pipelineStatus && pipelineStatus.tableTennisNetwork)]
   ]);
 }
 
@@ -423,7 +424,7 @@ function formatCurrentCollectorStatus(scanStatus) {
   return snapshot.ts ? `список матчей не открыт · видно ${visibleRows}` : "нет данных";
 }
 
-function formatBsportsfanNetworkStatus(network) {
+function formatTableTennisNetworkStatus(network) {
   const snapshot = network && typeof network === "object" ? network : {};
   const active = Math.max(0, Number(snapshot.active || 0));
   const queued = Math.max(0, Number(snapshot.queued || 0));
@@ -831,11 +832,11 @@ async function sendTelegramTabAction(detail) {
   let tab = Number.isInteger(collectorTabId) && collectorTabId > 0
     ? await chrome.tabs.get(collectorTabId).catch(() => null)
     : null;
-  if (!tab || !tab.id || !isBsportsfanUrl(tab.url)) {
+  if (!tab || !tab.id || !isTableTennisSourceUrl(tab.url)) {
     const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    tab = activeTab && isBsportsfanUrl(activeTab.url) ? activeTab : null;
+    tab = activeTab && isTableTennisSourceUrl(activeTab.url) ? activeTab : null;
   }
-  if (!tab || !tab.id || !isBsportsfanUrl(tab.url)) {
+  if (!tab || !tab.id || !isTableTennisSourceUrl(tab.url)) {
     const tabs = await chrome.tabs.query({
       url: [
         "https://bsportsfan.com/*",
@@ -845,7 +846,7 @@ async function sendTelegramTabAction(detail) {
       ]
     }).catch(() => []);
     tab = (Array.isArray(tabs) ? tabs : [])
-      .filter((candidate) => candidate && candidate.id && isBsportsfanUrl(candidate.url))
+      .filter((candidate) => candidate && candidate.id && isTableTennisSourceUrl(candidate.url))
       .sort((left, right) => (
         Number(!/\/cip\/table-tennis\/?(?:[?#]|$)/i.test(String(left.url || "")))
         - Number(!/\/cip\/table-tennis\/?(?:[?#]|$)/i.test(String(right.url || "")))
@@ -864,6 +865,7 @@ async function sendTelegramTabAction(detail) {
     await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       files: [
+        "src/shared/table-tennis-sources.js",
         "src/shared/pipeline-policy.js",
         "src/shared/start-match-rule.js",
         "src/shared/side-correction-guard.js",
@@ -1809,13 +1811,9 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isBsportsfanUrl(value) {
-  try {
-    const url = new URL(value || "");
-    return /(^|\.)(?:bsportsfan|betsapi)\.com$/i.test(url.hostname);
-  } catch (_) {
-    return false;
-  }
+function isTableTennisSourceUrl(value) {
+  const sourceApi = globalThis.LvrTableTennisSources;
+  return Boolean(sourceApi && sourceApi.getSourceId(value));
 }
 
 function finiteOrNull(value) {

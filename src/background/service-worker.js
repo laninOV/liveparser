@@ -2,6 +2,7 @@
 
 if (typeof importScripts === "function") {
   importScripts(
+    "../shared/table-tennis-sources.js",
     "../shared/pipeline-policy.js",
     "../shared/start-match-rule.js",
     "../shared/side-correction-guard.js",
@@ -80,20 +81,20 @@ const BSPORTSFAN_PROXY_FETCH_MAX_CHARS = 5 * 1024 * 1024;
 const BSPORTSFAN_PROXY_FETCH_CONCURRENCY = 1;
 const BSPORTSFAN_PROXY_FETCH_MIN_INTERVAL_MS = 5000;
 const BSPORTSFAN_PROXY_FETCH_QUEUE_MAX = 64;
-const BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS = 30 * 60 * 1000;
-const BSPORTSFAN_PROXY_REQUEST_RETRY_MS = 60 * 1000;
+const TABLE_TENNIS_PROTECTION_COOLDOWN_MS = 30 * 60 * 1000;
+const TABLE_TENNIS_REQUEST_RETRY_MS = 60 * 1000;
 const BSPORTSFAN_PROXY_CACHE_DEFAULT_TTL_MS = 30 * 1000;
 const BSPORTSFAN_PROXY_CACHE_MAX_TTL_MS = 10 * 60 * 1000;
 const BSPORTSFAN_PROXY_CACHE_MAX_ENTRIES = 48;
-const BSPORTSFAN_PROXY_PROTECTION_STORAGE_KEY = "bsportsfanProtectionState";
+const LEGACY_BSPORTSFAN_PROXY_PROTECTION_STORAGE_KEY = "bsportsfanProtectionState";
 const BSPORTSFAN_ATTENTION_NOTIFICATION_KEY = "bsportsfanAttentionNotification";
 const BSPORTSFAN_ATTENTION_NOTIFICATION_TTL_MS = 60 * 60 * 1000;
-const BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS = 6 * 60 * 60 * 1000;
-const BSPORTSFAN_HEALTH_ALARM_NAME = "lvr-bsportsfan-health";
-const BSPORTSFAN_HEALTH_STALE_MS = 2 * 60 * 1000;
-const BSPORTSFAN_PROGRESS_STALE_MS = 3 * 60 * 1000;
-const BSPORTSFAN_HEALTH_RELOAD_COOLDOWN_MS = 15 * 60 * 1000;
-const BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY = "bsportsfanHealthWatchdog";
+const TABLE_TENNIS_MANUAL_PROTECTION_PAUSE_MS = 6 * 60 * 60 * 1000;
+const TABLE_TENNIS_HEALTH_ALARM_NAME = "lvr-bsportsfan-health";
+const TABLE_TENNIS_HEALTH_STALE_MS = 2 * 60 * 1000;
+const TABLE_TENNIS_PROGRESS_STALE_MS = 3 * 60 * 1000;
+const TABLE_TENNIS_HEALTH_RELOAD_COOLDOWN_MS = 15 * 60 * 1000;
+const TABLE_TENNIS_HEALTH_WATCHDOG_STORAGE_KEY = "bsportsfanHealthWatchdog";
 const BSPORTSFAN_NAVIGATION_LEASE_STORAGE_KEY = "bsportsfanNavigationLeaseState";
 const BSPORTSFAN_FORECAST_LEASES_STORAGE_KEY = "bsportsfanForecastLeases";
 const BSPORTSFAN_MAINTENANCE_LEASE_STORAGE_KEY = "bsportsfanMaintenanceLease";
@@ -108,10 +109,10 @@ const TABLE_TENNIS_SOURCE_STATE_KEY = "tableTennisSourceStateV1";
 const TABLE_TENNIS_SOURCE_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
 const TABLE_TENNIS_ENDPOINT_BLOCKED_CODE = "table-tennis-endpoint-blocked";
 const TABLE_TENNIS_ENDPOINT_BLOCKED_RETRY_MS = 5 * 60 * 1000;
-const TABLE_TENNIS_SOURCE_ORIGINS = Object.freeze({
-  betsapi: "https://betsapi.com",
-  bsportsfan: "https://ru.bsportsfan.com"
-});
+const TABLE_TENNIS_SOURCE_API = globalThis.LvrTableTennisSources;
+const TABLE_TENNIS_SOURCE_ORIGINS = TABLE_TENNIS_SOURCE_API.ORIGINS;
+const getTableTennisDataSourceId = TABLE_TENNIS_SOURCE_API.getSourceId;
+const isSupportedTableTennisDataHostname = TABLE_TENNIS_SOURCE_API.isSupportedHostname;
 const TABLE_TENNIS_COLLECTOR_LEASE_STORAGE_KEY = "tableTennisCollectorLeaseV1";
 const TABLE_TENNIS_COLLECTOR_LEASE_MS = 90 * 1000;
 const DEFAULT_TELEGRAM_SETTINGS = {
@@ -153,12 +154,12 @@ const bsportsfanProxyFetchMetrics = {
   reprioritized: 0,
   peakQueued: 0
 };
-let bsportsfanProtectionStateLoaded = false;
-let bsportsfanProtectionStatePromise = null;
-let bsportsfanProtectionOpenUntil = 0;
-let bsportsfanProtectionReason = "";
-let betsapiProtectionOpenUntil = 0;
-let betsapiProtectionReason = "";
+let tableTennisProtectionStateLoaded = false;
+let tableTennisProtectionStatePromise = null;
+const tableTennisProtectionCircuits = {
+  betsapi: { openUntil: 0, reason: "" },
+  bsportsfan: { openUntil: 0, reason: "" }
+};
 let bsportsfanResultBackfillLeaseUntil = 0;
 let bsportsfanResultBackfillLeaseOwner = "";
 let bsportsfanResultBackfillLeaseToken = "";
@@ -178,19 +179,19 @@ let bsportsfanAttentionNotificationChain = Promise.resolve();
 
 chrome.runtime.onInstalled.addListener(() => {
   ensureBootstrapStorage().catch(() => {});
-  ensureBsportsfanHealthAlarm();
+  ensureTableTennisHealthAlarm();
 });
 
 if (chrome.runtime.onStartup && typeof chrome.runtime.onStartup.addListener === "function") {
   chrome.runtime.onStartup.addListener(() => {
-    ensureBsportsfanHealthAlarm();
+    ensureTableTennisHealthAlarm();
   });
 }
 
 if (chrome.alarms && chrome.alarms.onAlarm) {
   chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm && alarm.name === BSPORTSFAN_HEALTH_ALARM_NAME) {
-      runBsportsfanHealthWatchdog().catch(() => {});
+    if (alarm && alarm.name === TABLE_TENNIS_HEALTH_ALARM_NAME) {
+      runTableTennisHealthWatchdog().catch(() => {});
     }
   });
 }
@@ -216,14 +217,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 ensureBootstrapStorage().catch(() => {});
-ensureBsportsfanHealthAlarm();
+ensureTableTennisHealthAlarm();
 
-function ensureBsportsfanHealthAlarm() {
+function ensureTableTennisHealthAlarm() {
   if (!chrome.alarms || typeof chrome.alarms.create !== "function") {
     return;
   }
   try {
-    chrome.alarms.create(BSPORTSFAN_HEALTH_ALARM_NAME, {
+    chrome.alarms.create(TABLE_TENNIS_HEALTH_ALARM_NAME, {
       delayInMinutes: 1,
       periodInMinutes: 1
     });
@@ -232,35 +233,35 @@ function ensureBsportsfanHealthAlarm() {
   }
 }
 
-async function runBsportsfanHealthWatchdog(now = Date.now()) {
-  await ensureBsportsfanProtectionStateLoaded();
+async function runTableTennisHealthWatchdog(now = Date.now()) {
+  await ensureTableTennisProtectionStateLoaded();
   const storage = await chrome.storage.local.get({
     scanStatus: null,
-    [BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY]: null
+    [TABLE_TENNIS_HEALTH_WATCHDOG_STORAGE_KEY]: null
   });
   const scanStatus = storage.scanStatus && typeof storage.scanStatus === "object"
     ? storage.scanStatus
     : null;
   await reconcileTableTennisSourceHealthFromScanStatus(scanStatus, now).catch(() => {});
-  const betsapiCircuitError = getBsportsfanProtectionCircuitError("betsapi", now);
-  const bsportsfanCircuitError = getBsportsfanProtectionCircuitError("bsportsfan", now);
+  const betsapiCircuitError = getTableTennisProtectionCircuitError("betsapi", now);
+  const bsportsfanCircuitError = getTableTennisProtectionCircuitError("bsportsfan", now);
   if (betsapiCircuitError && bsportsfanCircuitError) {
     return { reloaded: false, reason: "protection-active" };
   }
   const heartbeatAt = Number(scanStatus && scanStatus.ts || 0);
-  const heartbeatStale = !(heartbeatAt > 0) || now - heartbeatAt >= BSPORTSFAN_HEALTH_STALE_MS;
-  const progress = summarizeBsportsfanCollectorProgress(scanStatus, now);
-  const previous = storage[BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY]
-    && typeof storage[BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY] === "object"
-    ? storage[BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY]
+  const heartbeatStale = !(heartbeatAt > 0) || now - heartbeatAt >= TABLE_TENNIS_HEALTH_STALE_MS;
+  const progress = summarizeTableTennisCollectorProgress(scanStatus, now);
+  const previous = storage[TABLE_TENNIS_HEALTH_WATCHDOG_STORAGE_KEY]
+    && typeof storage[TABLE_TENNIS_HEALTH_WATCHDOG_STORAGE_KEY] === "object"
+    ? storage[TABLE_TENNIS_HEALTH_WATCHDOG_STORAGE_KEY]
     : {};
   const progressChanged = progress.signature !== normalizeTelegramText(previous.progressSignature || "");
   const progressObservedAt = progressChanged
     ? now
     : Number(previous.progressObservedAt || 0) || now;
-  if (!heartbeatStale && (!progress.active || now - progressObservedAt < BSPORTSFAN_PROGRESS_STALE_MS)) {
+  if (!heartbeatStale && (!progress.active || now - progressObservedAt < TABLE_TENNIS_PROGRESS_STALE_MS)) {
     await chrome.storage.local.set({
-      [BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY]: {
+      [TABLE_TENNIS_HEALTH_WATCHDOG_STORAGE_KEY]: {
         ...previous,
         progressSignature: progress.signature,
         progressObservedAt,
@@ -334,11 +335,11 @@ async function runBsportsfanHealthWatchdog(now = Date.now()) {
   }
   const reloadSourceId = getTableTennisDataSourceId(tab.url || "") || statusSourceId || "unknown";
   const lastReloadAt = Number(reloadBySource[reloadSourceId] || 0);
-  if (lastReloadAt > 0 && now - lastReloadAt < BSPORTSFAN_HEALTH_RELOAD_COOLDOWN_MS) {
+  if (lastReloadAt > 0 && now - lastReloadAt < TABLE_TENNIS_HEALTH_RELOAD_COOLDOWN_MS) {
     return { reloaded: false, reason: "reload-cooldown", sourceId: reloadSourceId };
   }
   await chrome.storage.local.set({
-    [BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY]: {
+    [TABLE_TENNIS_HEALTH_WATCHDOG_STORAGE_KEY]: {
       lastReloadAt: now,
       reloadBySource: {
         ...reloadBySource,
@@ -361,7 +362,7 @@ async function runBsportsfanHealthWatchdog(now = Date.now()) {
   };
 }
 
-function summarizeBsportsfanCollectorProgress(scanStatus, now = Date.now()) {
+function summarizeTableTennisCollectorProgress(scanStatus, now = Date.now()) {
   const monitor = scanStatus && scanStatus.bsportsfan
     && scanStatus.bsportsfan.cipMonitor
     && typeof scanStatus.bsportsfan.cipMonitor === "object"
@@ -432,7 +433,6 @@ function isBootstrapIndependentMessage(message) {
     "lvr:releaseBsportsfanRequestSlot",
     "lvr:reportBsportsfanProtection",
     "lvr:reportBsportsfanHealthy",
-    "lvr:getTableTennisSourceRoute",
     "lvr:claimTableTennisCollector",
     "lvr:getTableTennisCollector",
     "lvr:notifyBsportsfanAttention",
@@ -507,22 +507,6 @@ async function handleMessage(message, sender = null) {
     return { scanStatus };
   }
 
-  if (message.type === "lvr:getTableTennisSourceRoute") {
-    validateBsportsfanProxySender(sender);
-    const sourceId = getTableTennisDataSourceId(
-      message.url || sender && sender.url || ""
-    );
-    const state = message.failed === true && sourceId
-      ? await markTableTennisSourceFailure(sourceId, {
-          reason: message.reason || message.code || "source-unavailable",
-          retryAfterMs: message.retryAfterMs
-        })
-      : await getTableTennisSourceState();
-    return buildTableTennisSourceRoute(state, {
-      currentSourceId: sourceId
-    });
-  }
-
   if (message.type === "lvr:claimTableTennisCollector") {
     validateBsportsfanProxySender(sender);
     return claimTableTennisCollectorLease(sender, message.url, {
@@ -548,8 +532,8 @@ async function handleMessage(message, sender = null) {
   if (message.type === "lvr:acquireBsportsfanRequestSlot") {
     const requestUrl = validateBsportsfanProxyRequest(message.url, sender);
     const sourceId = getTableTennisDataSourceId(requestUrl.href);
-    await ensureBsportsfanProtectionStateLoaded();
-    throwIfBsportsfanProtectionCircuitOpen(sourceId);
+    await ensureTableTennisProtectionStateLoaded();
+    throwIfTableTennisProtectionCircuitOpen(sourceId);
     return scheduleBsportsfanProxyFetch(
       () => grantBsportsfanNavigationLease(message.deadlineAt, sender, sourceId),
       message.deadlineAt,
@@ -568,7 +552,7 @@ async function handleMessage(message, sender = null) {
 
   if (message.type === "lvr:reportBsportsfanProtection") {
     validateBsportsfanProxySender(sender);
-    await ensureBsportsfanProtectionStateLoaded();
+    await ensureTableTennisProtectionStateLoaded();
     const pageSourceId = getTableTennisDataSourceId(
       message.url || sender && sender.url || ""
     );
@@ -609,14 +593,14 @@ async function handleMessage(message, sender = null) {
       || normalizeTelegramText(message.code || "") === "bsportsfan-rate-limited";
     const sessionExpired = normalizeTelegramText(message.code || "") === "bsportsfan-session-expired";
     const minimumCooldownMs = manualRequired
-      ? BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS
+      ? TABLE_TENNIS_MANUAL_PROTECTION_PAUSE_MS
       : rateLimited
-        ? BSPORTSFAN_PROXY_REQUEST_RETRY_MS
+        ? TABLE_TENNIS_REQUEST_RETRY_MS
         : sessionExpired
           ? 5 * 60 * 1000
-          : BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS;
+          : TABLE_TENNIS_PROTECTION_COOLDOWN_MS;
     const maximumCooldownMs = manualRequired
-      ? BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS
+      ? TABLE_TENNIS_MANUAL_PROTECTION_PAUSE_MS
       : rateLimited
         ? 5 * 60 * 1000
         : sessionExpired
@@ -630,9 +614,8 @@ async function handleMessage(message, sender = null) {
       )
     );
     const sourceId = pageSourceId;
-    openBsportsfanProtectionCircuit(
+    await openTableTennisProtectionCircuit(
       normalizeTelegramText(message.reason || message.code || "bsportsfan-challenge"),
-      Number(message.status || 0) || 0,
       requestedCooldownMs,
       sourceId,
       failureObservedAt
@@ -657,7 +640,7 @@ async function handleMessage(message, sender = null) {
 
   if (message.type === "lvr:reportBsportsfanHealthy") {
     validateBsportsfanProxySender(sender);
-    await ensureBsportsfanProtectionStateLoaded();
+    await ensureTableTennisProtectionStateLoaded();
     const sourceId = getTableTennisDataSourceId(
       message.url || sender && sender.url || ""
     );
@@ -699,7 +682,7 @@ async function handleMessage(message, sender = null) {
       ? await markTableTennisSourceHealthy(sourceId, { observedAt: healthObservedAt })
       : currentSourceState;
     const cleared = sourceId
-      ? await closeBsportsfanProtectionCircuit(sourceId)
+      ? await closeTableTennisProtectionCircuit(sourceId)
       : false;
     if (stateRecovered || cleared) {
       await chrome.storage.local.remove(BSPORTSFAN_ATTENTION_NOTIFICATION_KEY).catch(() => {});
@@ -822,7 +805,7 @@ async function handleMessage(message, sender = null) {
   }
 
   if (message.type === "lvr:acquireBsportsfanResultBackfillLease") {
-    await ensureBsportsfanProtectionStateLoaded();
+    await ensureTableTennisProtectionStateLoaded();
     const now = Date.now();
     const requestedLeaseMs = Math.max(1000, Number(message.leaseMs || 0) || 0);
     const leaseMs = Math.min(BSPORTSFAN_RESULT_BACKFILL_LEASE_MAX_MS, requestedLeaseMs);
@@ -856,7 +839,7 @@ async function handleMessage(message, sender = null) {
   }
 
   if (message.type === "lvr:releaseBsportsfanResultBackfillLease") {
-    await ensureBsportsfanProtectionStateLoaded();
+    await ensureTableTennisProtectionStateLoaded();
     const token = normalizeTelegramText(message.token || "");
     if (token && token === bsportsfanResultBackfillLeaseToken) {
       bsportsfanResultBackfillLeaseUntil = 0;
@@ -996,10 +979,10 @@ async function clearBsportsfanTransientRuntimeState(clearProtection = false) {
   bsportsfanForecastLeases.clear();
   bsportsfanProxyResponseCache.clear();
   if (clearProtection) {
-    bsportsfanProtectionOpenUntil = 0;
-    bsportsfanProtectionReason = "";
-    betsapiProtectionOpenUntil = 0;
-    betsapiProtectionReason = "";
+    for (const circuit of Object.values(tableTennisProtectionCircuits)) {
+      circuit.openUntil = 0;
+      circuit.reason = "";
+    }
     await resetTableTennisSourceState();
   }
   const sessionStorage = chrome.storage && chrome.storage.session;
@@ -1022,7 +1005,7 @@ async function clearBsportsfanTransientRuntimeState(clearProtection = false) {
       TABLE_TENNIS_COLLECTOR_LEASE_STORAGE_KEY
     ];
     if (clearProtection) {
-      keys.push(BSPORTSFAN_PROXY_PROTECTION_STORAGE_KEY);
+      keys.push(LEGACY_BSPORTSFAN_PROXY_PROTECTION_STORAGE_KEY);
     }
     await sessionStorage.remove(keys);
     if (
@@ -1042,8 +1025,8 @@ async function clearBsportsfanTransientRuntimeState(clearProtection = false) {
 async function fetchBsportsfanTextShared(value, options = {}) {
   const requestUrl = validateBsportsfanProxyRequest(value, options.sender);
   const sourceId = getTableTennisDataSourceId(requestUrl.href);
-  await ensureBsportsfanProtectionStateLoaded();
-  throwIfBsportsfanProtectionCircuitOpen(sourceId);
+  await ensureTableTennisProtectionStateLoaded();
+  throwIfTableTennisProtectionCircuitOpen(sourceId);
 
   const cacheKey = normalizeBsportsfanProxyCacheKey(value);
   const now = Date.now();
@@ -1294,7 +1277,7 @@ function areBothTableTennisSourcesUnavailable(sourceState, now = Date.now()) {
 
 async function notifyBsportsfanAttentionNow(value = {}) {
   await new Promise((resolve) => setTimeout(resolve, 5000));
-  await ensureBsportsfanProtectionStateLoaded();
+  await ensureTableTennisProtectionStateLoaded();
   const now = Date.now();
   const kind = normalizeTelegramText(value.kind || value.code || "security-challenge");
   const stored = await chrome.storage.local.get({
@@ -1374,7 +1357,7 @@ async function prepareBsportsfanLiveSessionRecovery(sender) {
     };
   }
   await Promise.all([
-    ensureBsportsfanProtectionStateLoaded(),
+    ensureTableTennisProtectionStateLoaded(),
     ensureBsportsfanForecastLeasesLoaded()
   ]);
 
@@ -1393,9 +1376,8 @@ async function prepareBsportsfanLiveSessionRecovery(sender) {
     bsportsfanNavigationLeaseToken
     && (!bsportsfanNavigationLeaseSourceId || bsportsfanNavigationLeaseSourceId === sourceId)
   );
-  openBsportsfanProtectionCircuit(
+  await openTableTennisProtectionCircuit(
     "bsportsfan-session-recovery",
-    0,
     5 * 60 * 1000,
     sourceId
   );
@@ -1645,7 +1627,7 @@ function drainBsportsfanProxyFetchQueue() {
       const candidateSourceId = TABLE_TENNIS_SOURCE_ORIGINS[candidate.sourceId]
         ? candidate.sourceId
         : "bsportsfan";
-      const circuitError = getBsportsfanProtectionCircuitError(candidateSourceId, now);
+      const circuitError = getTableTennisProtectionCircuitError(candidateSourceId, now);
       if (circuitError) {
         bsportsfanProxyFetchQueue.splice(index, 1);
         candidate.state = "failed";
@@ -1767,56 +1749,33 @@ function setBsportsfanProxyResponseCache(cacheKey, response, ttlMs) {
   }
 }
 
-async function ensureBsportsfanProtectionStateLoaded() {
-  if (bsportsfanProtectionStateLoaded) {
+async function ensureTableTennisProtectionStateLoaded() {
+  if (tableTennisProtectionStateLoaded) {
     return;
   }
-  if (bsportsfanProtectionStatePromise) {
-    return bsportsfanProtectionStatePromise;
+  if (tableTennisProtectionStatePromise) {
+    return tableTennisProtectionStatePromise;
   }
   const sessionStorage = chrome.storage && chrome.storage.session;
   const sessionStatePromise = sessionStorage && typeof sessionStorage.get === "function"
     ? sessionStorage.get({
-        [BSPORTSFAN_PROXY_PROTECTION_STORAGE_KEY]: null,
         [BSPORTSFAN_NAVIGATION_LEASE_STORAGE_KEY]: null,
         [BSPORTSFAN_MAINTENANCE_LEASE_STORAGE_KEY]: null
       }).catch(() => ({}))
     : Promise.resolve({});
-  bsportsfanProtectionStatePromise = Promise.all([
+  tableTennisProtectionStatePromise = Promise.all([
     sessionStatePromise,
     getTableTennisSourceState()
   ]).then(([stored, sourceState]) => {
-    const state = stored && stored[BSPORTSFAN_PROXY_PROTECTION_STORAGE_KEY];
-    bsportsfanProtectionOpenUntil = Math.max(
-      bsportsfanProtectionOpenUntil,
-      Number(state && state.openUntil || 0) || 0,
-      Number(sourceState && sourceState.sources && sourceState.sources.bsportsfan
-        && sourceState.sources.bsportsfan.cooldownUntil || 0) || 0
-    );
-    bsportsfanProtectionReason = String(
-      state && state.reason
-      || sourceState && sourceState.sources && sourceState.sources.bsportsfan
-        && sourceState.sources.bsportsfan.reason
-      || bsportsfanProtectionReason
-      || ""
-    );
-    if (Number(state && state.openUntil || 0) > Date.now()) {
-      markTableTennisSourceFailure("bsportsfan", {
-        reason: state && state.reason || "legacy-bsportsfan-protection",
-        retryAfterMs: Number(state.openUntil) - Date.now()
-      }).catch(() => {});
+    for (const sourceId of Object.keys(tableTennisProtectionCircuits)) {
+      const source = sourceState && sourceState.sources && sourceState.sources[sourceId] || {};
+      const circuit = tableTennisProtectionCircuits[sourceId];
+      circuit.openUntil = Math.max(0, Number(source.cooldownUntil || 0) || 0);
+      circuit.reason = normalizeTelegramText(source.reason || "");
     }
-    betsapiProtectionOpenUntil = Math.max(
-      betsapiProtectionOpenUntil,
-      Number(sourceState && sourceState.sources && sourceState.sources.betsapi
-        && sourceState.sources.betsapi.cooldownUntil || 0) || 0
-    );
-    betsapiProtectionReason = String(
-      sourceState && sourceState.sources && sourceState.sources.betsapi
-        && sourceState.sources.betsapi.reason
-      || betsapiProtectionReason
-      || ""
-    );
+    if (sessionStorage && typeof sessionStorage.remove === "function") {
+      sessionStorage.remove(LEGACY_BSPORTSFAN_PROXY_PROTECTION_STORAGE_KEY).catch(() => {});
+    }
     const navigationState = stored && stored[BSPORTSFAN_NAVIGATION_LEASE_STORAGE_KEY];
     if (Number(navigationState && navigationState.leaseUntil || 0) > Date.now()) {
       bsportsfanNavigationLeaseToken = normalizeTelegramText(navigationState.token || "");
@@ -1834,34 +1793,29 @@ async function ensureBsportsfanProtectionStateLoaded() {
       bsportsfanResultBackfillLeaseUntil = Number(maintenanceState.leaseUntil || 0);
     }
   }).catch(() => {}).finally(() => {
-    bsportsfanProtectionStateLoaded = true;
-    bsportsfanProtectionStatePromise = null;
+    tableTennisProtectionStateLoaded = true;
+    tableTennisProtectionStatePromise = null;
   });
-  return bsportsfanProtectionStatePromise;
+  return tableTennisProtectionStatePromise;
 }
 
-function openBsportsfanProtectionCircuit(
+async function openTableTennisProtectionCircuit(
   reason,
-  status = 0,
-  cooldownMs = BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS,
+  cooldownMs = TABLE_TENNIS_PROTECTION_COOLDOWN_MS,
   sourceId = "bsportsfan",
   observedAt = Date.now()
 ) {
   const openUntil = Date.now() + Math.max(
     1000,
-    Number(cooldownMs || BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS)
-      || BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS
+    Number(cooldownMs || TABLE_TENNIS_PROTECTION_COOLDOWN_MS)
+      || TABLE_TENNIS_PROTECTION_COOLDOWN_MS
   );
   const normalizedSourceId = TABLE_TENNIS_SOURCE_ORIGINS[sourceId]
     ? sourceId
     : "bsportsfan";
-  if (normalizedSourceId === "betsapi") {
-    betsapiProtectionOpenUntil = Math.max(betsapiProtectionOpenUntil, openUntil);
-    betsapiProtectionReason = String(reason || "betsapi-protection");
-  } else {
-    bsportsfanProtectionOpenUntil = Math.max(bsportsfanProtectionOpenUntil, openUntil);
-    bsportsfanProtectionReason = String(reason || "bsportsfan-protection");
-  }
+  const circuit = tableTennisProtectionCircuits[normalizedSourceId];
+  circuit.openUntil = Math.max(Number(circuit.openUntil || 0), openUntil);
+  circuit.reason = normalizeTelegramText(reason || `${normalizedSourceId}-protection`);
   for (const key of Array.from(bsportsfanProxyResponseCache.keys())) {
     if (getTableTennisDataSourceId(key) === normalizedSourceId) {
       bsportsfanProxyResponseCache.delete(key);
@@ -1876,77 +1830,49 @@ function openBsportsfanProtectionCircuit(
   ) {
     releaseBsportsfanNavigationLease(bsportsfanNavigationLeaseToken, true);
   }
-  const error = getBsportsfanProtectionCircuitError(normalizedSourceId);
+  const error = getTableTennisProtectionCircuitError(normalizedSourceId);
   if (error) {
     rejectQueuedBsportsfanProxyFetches(
       error,
       (job) => normalizeTelegramText(job && job.sourceId || "") === normalizedSourceId
     );
   }
-  markTableTennisSourceFailure(normalizedSourceId, {
+  await markTableTennisSourceFailure(normalizedSourceId, {
     reason,
     retryAfterMs: Math.max(0, openUntil - Date.now()),
     observedAt
-  }).catch(() => {});
-  const sessionStorage = chrome.storage && chrome.storage.session;
-  if (
-    normalizedSourceId === "bsportsfan"
-    && sessionStorage
-    && typeof sessionStorage.set === "function"
-  ) {
-    sessionStorage.set({
-      [BSPORTSFAN_PROXY_PROTECTION_STORAGE_KEY]: {
-        openUntil: bsportsfanProtectionOpenUntil,
-        reason: bsportsfanProtectionReason,
-        status: Number(status || 0) || 0,
-        updatedAt: Date.now()
-      }
-    }).catch(() => {});
-  }
+  });
 }
 
-async function closeBsportsfanProtectionCircuit(sourceId = "bsportsfan") {
+async function closeTableTennisProtectionCircuit(sourceId = "bsportsfan") {
   const normalizedSourceId = TABLE_TENNIS_SOURCE_ORIGINS[sourceId]
     ? sourceId
     : "bsportsfan";
-  const hadCircuit = normalizedSourceId === "betsapi"
-    ? Boolean(betsapiProtectionOpenUntil || betsapiProtectionReason)
-    : Boolean(bsportsfanProtectionOpenUntil || bsportsfanProtectionReason);
-  if (normalizedSourceId === "betsapi") {
-    betsapiProtectionOpenUntil = 0;
-    betsapiProtectionReason = "";
-  } else {
-    bsportsfanProtectionOpenUntil = 0;
-    bsportsfanProtectionReason = "";
-  }
-  const sessionStorage = chrome.storage && chrome.storage.session;
-  if (
-    normalizedSourceId === "bsportsfan"
-    && sessionStorage
-    && typeof sessionStorage.remove === "function"
-  ) {
-    await sessionStorage.remove(BSPORTSFAN_PROXY_PROTECTION_STORAGE_KEY).catch(() => {});
-  }
+  const circuit = tableTennisProtectionCircuits[normalizedSourceId];
+  const hadCircuit = Boolean(circuit.openUntil || circuit.reason);
+  circuit.openUntil = 0;
+  circuit.reason = "";
   if (hadCircuit) {
     drainBsportsfanProxyFetchQueue();
   }
   return hadCircuit;
 }
 
-function throwIfBsportsfanProtectionCircuitOpen(sourceId = "bsportsfan") {
-  const error = getBsportsfanProtectionCircuitError(sourceId);
+function throwIfTableTennisProtectionCircuitOpen(sourceId = "bsportsfan") {
+  const error = getTableTennisProtectionCircuitError(sourceId);
   if (error) {
     throw error;
   }
 }
 
 function getTableTennisSourceProtectionOpenUntil(sourceId) {
-  return sourceId === "betsapi"
-    ? Number(betsapiProtectionOpenUntil || 0)
-    : Number(bsportsfanProtectionOpenUntil || 0);
+  const normalizedSourceId = TABLE_TENNIS_SOURCE_ORIGINS[sourceId]
+    ? sourceId
+    : "bsportsfan";
+  return Number(tableTennisProtectionCircuits[normalizedSourceId].openUntil || 0);
 }
 
-function getBsportsfanProtectionCircuitError(sourceId = "bsportsfan", now = Date.now()) {
+function getTableTennisProtectionCircuitError(sourceId = "bsportsfan", now = Date.now()) {
   const normalizedSourceId = TABLE_TENNIS_SOURCE_ORIGINS[sourceId]
     ? sourceId
     : "bsportsfan";
@@ -1955,13 +1881,9 @@ function getBsportsfanProtectionCircuitError(sourceId = "bsportsfan", now = Date
     getTableTennisSourceProtectionOpenUntil(normalizedSourceId) - Number(now)
   );
   if (retryAfterMs <= 0) {
-    if (normalizedSourceId === "betsapi") {
-      betsapiProtectionOpenUntil = 0;
-      betsapiProtectionReason = "";
-    } else if (bsportsfanProtectionOpenUntil) {
-      bsportsfanProtectionOpenUntil = 0;
-      bsportsfanProtectionReason = "";
-    }
+    const circuit = tableTennisProtectionCircuits[normalizedSourceId];
+    circuit.openUntil = 0;
+    circuit.reason = "";
     return null;
   }
   const error = createServiceWorkerError(
@@ -1991,7 +1913,7 @@ function cloneBsportsfanProtectionError(source) {
 async function fetchBsportsfanText(value, options = {}) {
   const url = validateBsportsfanProxyRequest(value, options.sender);
   const sourceId = getTableTennisDataSourceId(url.href) || "bsportsfan";
-  throwIfBsportsfanProtectionCircuitOpen(sourceId);
+  throwIfTableTennisProtectionCircuitOpen(sourceId);
 
   const requestedDeadlineAt = Number(options.deadlineAt || 0);
   const deadlineAt = Number.isFinite(requestedDeadlineAt) && requestedDeadlineAt > 0
@@ -2110,30 +2032,6 @@ function isBsportsfanLiveSessionExpiredResponse(value) {
   );
 }
 
-function isSupportedTableTennisDataHostname(value) {
-  const hostname = String(value || "").toLowerCase();
-  return hostname === "bsportsfan.com"
-    || hostname.endsWith(".bsportsfan.com")
-    || hostname === "betsapi.com"
-    || hostname.endsWith(".betsapi.com");
-}
-
-function getTableTennisDataSourceId(value) {
-  let hostname = "";
-  try {
-    hostname = new URL(String(value || "")).hostname.toLowerCase();
-  } catch (_) {
-    hostname = String(value || "").toLowerCase();
-  }
-  if (hostname === "betsapi.com" || hostname.endsWith(".betsapi.com")) {
-    return "betsapi";
-  }
-  if (hostname === "bsportsfan.com" || hostname.endsWith(".bsportsfan.com")) {
-    return "bsportsfan";
-  }
-  return "";
-}
-
 function createDefaultTableTennisSourceState() {
   return {
     version: 1,
@@ -2245,7 +2143,7 @@ function markTableTennisSourceFailure(sourceId, options = {}) {
     source.failureCount = Math.min(100, source.failureCount + 1);
     source.lastFailureAt = Math.max(Number(source.lastFailureAt || 0), observedAt);
     source.reason = normalizeTelegramText(options.reason || "source-unavailable");
-    const fallbackId = sourceId === "betsapi" ? "bsportsfan" : "betsapi";
+    const fallbackId = TABLE_TENNIS_SOURCE_API.getAlternateSourceId(sourceId);
     if (Number(state.sources[fallbackId].cooldownUntil || 0) <= now) {
       state.activeSourceId = fallbackId;
     }
@@ -2292,7 +2190,7 @@ function getHealthyTableTennisScanSourceId(scanStatus, sourceState, now = Date.n
   if (
     normalizeTelegramText(status.source || "").toLowerCase() !== "table-tennis"
     || !(heartbeatAt > 0)
-    || now - heartbeatAt > BSPORTSFAN_HEALTH_STALE_MS
+    || now - heartbeatAt > TABLE_TENNIS_HEALTH_STALE_MS
   ) {
     return "";
   }
@@ -2324,7 +2222,7 @@ function getHealthyTableTennisScanSourceId(scanStatus, sourceState, now = Date.n
 }
 
 async function reconcileTableTennisSourceHealthFromScanStatus(scanStatus, now = Date.now()) {
-  await ensureBsportsfanProtectionStateLoaded();
+  await ensureTableTennisProtectionStateLoaded();
   const collectorLease = await getTableTennisCollectorLease().catch(() => null);
   const recordedCollector = scanStatus && typeof scanStatus.collector === "object"
     ? scanStatus.collector
@@ -2350,7 +2248,7 @@ async function reconcileTableTennisSourceHealthFromScanStatus(scanStatus, now = 
     return { cleared: false, sourceId };
   }
   await markTableTennisSourceHealthy(sourceId);
-  const circuitCleared = await closeBsportsfanProtectionCircuit(sourceId);
+  const circuitCleared = await closeTableTennisProtectionCircuit(sourceId);
   await chrome.storage.local.remove(BSPORTSFAN_ATTENTION_NOTIFICATION_KEY).catch(() => {});
   return {
     cleared: true,
@@ -2368,21 +2266,10 @@ function buildTableTennisSourceRoute(stateValue, options = {}) {
   const currentSourceId = TABLE_TENNIS_SOURCE_ORIGINS[options.currentSourceId]
     ? options.currentSourceId
     : "";
-  const alternateSourceId = currentSourceId === "betsapi"
-    ? "bsportsfan"
-    : currentSourceId === "bsportsfan"
-      ? "betsapi"
-      : "";
-  const candidates = [
+  const candidates = TABLE_TENNIS_SOURCE_API.buildCandidateSourceIds(
     currentSourceId,
-    alternateSourceId,
-    state.activeSourceId,
-    "betsapi",
-    "bsportsfan"
-  ].filter((sourceId, index, values) => (
-    TABLE_TENNIS_SOURCE_ORIGINS[sourceId]
-    && values.indexOf(sourceId) === index
-  ));
+    state.activeSourceId
+  );
   const targetSourceId = candidates.find(available) || "";
   const retryAt = targetSourceId
     ? 0
@@ -7254,7 +7141,7 @@ function pruneTelegramStatsMessageRefs(map) {
 async function buildTelegramStatsSummary() {
   await Promise.all([
     flushTelegramPredictionPointSnapshots(),
-    ensureBsportsfanProtectionStateLoaded()
+    ensureTableTennisProtectionStateLoaded()
   ]);
   const [rows, storage] = await Promise.all([
     readTelegramPredictionDataset(),
@@ -7284,22 +7171,29 @@ function buildTelegramCollectorHealth(scanStatus, now = Date.now()) {
     };
   }
   if (source === "bsportsfan-protection" || bsportsfan.challenge === true) {
-    const retryAt = Number(bsportsfan.autoRetryAt || bsportsfanProtectionOpenUntil || 0);
+    const currentSourceId = getTableTennisDataSourceId(bsportsfan.url || "") || "bsportsfan";
+    const retryAt = Number(
+      bsportsfan.autoRetryAt
+      || getTableTennisSourceProtectionOpenUntil(currentSourceId)
+      || 0
+    );
     return {
       state: "challenge",
       text: retryAt > now
         ? `⏸ Сбор: проверка сайта · автоповтор в ${formatTelegramStatsTime(retryAt)}`
-        : "🔄 Сбор: повторно подключается к BSportsFan"
+        : "🔄 Сбор: повторно подключается к источнику"
     };
   }
-  if (bsportsfanProtectionOpenUntil > now && betsapiProtectionOpenUntil > now) {
+  const bsportsfanRetryAt = getTableTennisSourceProtectionOpenUntil("bsportsfan");
+  const betsapiRetryAt = getTableTennisSourceProtectionOpenUntil("betsapi");
+  if (bsportsfanRetryAt > now && betsapiRetryAt > now) {
     return {
       state: "cooldown",
-      text: `⏸ Сбор: оба источника на паузе до ${formatTelegramStatsTime(Math.min(bsportsfanProtectionOpenUntil, betsapiProtectionOpenUntil))}`
+      text: `⏸ Сбор: оба источника на паузе до ${formatTelegramStatsTime(Math.min(bsportsfanRetryAt, betsapiRetryAt))}`
     };
   }
   const heartbeatAt = Number(safeStatus.ts || 0);
-  if (!(heartbeatAt > 0) || now - heartbeatAt >= BSPORTSFAN_HEALTH_STALE_MS) {
+  if (!(heartbeatAt > 0) || now - heartbeatAt >= TABLE_TENNIS_HEALTH_STALE_MS) {
     return {
       state: "stale",
       text: "⚠️ Сбор: нет ответа, включено автовосстановление"
@@ -8778,7 +8672,7 @@ async function getTelegramPipelineStatus() {
 
   return {
     prematch: summarizeTelegramPipelineSettings(settings),
-    bsportsfanNetwork: {
+    tableTennisNetwork: {
       active: bsportsfanProxyFetchActive,
       queued: bsportsfanProxyFetchQueue.length,
       inFlightUrls: bsportsfanProxyFetchInFlight.size,
