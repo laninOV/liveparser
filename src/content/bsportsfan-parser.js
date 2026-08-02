@@ -64,6 +64,8 @@
     && globalThis.LvrVerifiedPairRegimeV1.PROTOCOL || {};
   const MATCH_START_PAIR_GATE_ID = String(MATCH_START_PAIR_PROTOCOL.gateId || "");
   const PLAYER_MATCHES_CACHE_TTL_MS = 20 * 60 * 1000;
+  const PLAYER_MATCHES_STALE_FALLBACK_TTL_MS = 2 * 60 * 60 * 1000;
+  const PLAYER_MATCHES_CACHE_MAX_ENTRIES = 192;
   const PLAYER_MATCHES_CACHE_STORAGE_KEY = "__lvrPlayerMatchesCacheV1";
   const SHARED_PLAYER_MATCHES_CACHE_STORAGE_KEY = "tableTennisSharedPlayerMatchesCacheV1";
   const PLAYER_MATCHES_CACHE_STORAGE_VERSION = 1;
@@ -442,7 +444,7 @@
       parsed.flatMap((value) => Array.isArray(value.entries) ? value.entries : []),
       getCanonicalTableTennisPlayerCacheKey,
       (entry) => Number(entry && entry.ts || 0),
-      NETWORK_CACHE_MAX_ENTRIES
+      PLAYER_MATCHES_CACHE_MAX_ENTRIES
     );
     return JSON.stringify({
       version: PLAYER_MATCHES_CACHE_STORAGE_VERSION,
@@ -8751,12 +8753,18 @@
           .slice(0, scoreHistoryMatchesPerPlayer)
           .map((match) => buildPlayerScoreHistoryItem(playerName, match))
           .filter(Boolean);
+        const profileCacheAgeMs = availableMatches.reduce(
+          (maximum, match) => Math.max(maximum, Number(match && match.profileCacheAgeMs || 0) || 0),
+          0
+        );
 
         result.playerPages.push({
           player: playerName,
           url: link.url,
           matches: Math.min(matches.length, matchesPerPlayer),
           candidates: availableMatches.length,
+          profileCacheFallback: profileCacheAgeMs > 0,
+          profileCacheAgeMs,
           scoreHistoryMatches: scoreHistory.length,
           scoreHistory,
           selected: matches.map((match) => ({
@@ -10034,7 +10042,11 @@
   async function fetchPlayerResultMatches(url, options = {}) {
     ensurePlayerMatchesCacheLoaded();
     const cacheKey = getCanonicalTableTennisPlayerCacheKey(url);
-    const sourceUrl = preferTableTennisEndpointUrl(url, "player-history");
+    // Player profiles must first be read from the source that is actually open
+    // in the collector tab. A remembered endpoint override may point at the
+    // twin host, but a cross-origin hidden frame cannot be inspected and used
+    // to turn every subsequent profile lookup into a timeout.
+    const sourceUrl = rebaseTableTennisDataUrl(url, location.origin);
     const cached = playerMatchesCache.get(cacheKey);
     if (
       cached
@@ -10044,9 +10056,14 @@
       return cached.promise;
     }
     if (cached && Array.isArray(cached.matches) && Date.now() - Number(cached.ts || 0) <= PLAYER_MATCHES_CACHE_TTL_MS) {
-      setBoundedMapValue(playerMatchesCache, cacheKey, cached, NETWORK_CACHE_MAX_ENTRIES);
+      setBoundedMapValue(playerMatchesCache, cacheKey, cached, PLAYER_MATCHES_CACHE_MAX_ENTRIES);
       return rebasePlayerResultMatchesForCurrentSource(cached.matches);
     }
+    const staleCached = cached
+      && Array.isArray(cached.matches)
+      && Date.now() - Number(cached.ts || 0) <= PLAYER_MATCHES_STALE_FALLBACK_TTL_MS
+      ? cached
+      : null;
     if (cached && cached.promise) {
       playerMatchesCache.delete(cacheKey);
     }
@@ -10061,7 +10078,11 @@
     };
     const promise = fetchPlayerResultMatchesUncached(sourceUrl, {
       ...options,
-      deadlineAt
+      deadlineAt,
+      // Server-rendered result rows do not need an iframe. A same-origin fetch
+      // has the live page session and is much less likely to be rejected than
+      // a hidden navigation.
+      allowIframe: false
     })
       .then((matches) => {
         const safeMatches = rebasePlayerResultMatchesForCurrentSource(matches)
@@ -10071,20 +10092,38 @@
             playerMatchesCache,
             cacheKey,
             { ts: Date.now(), matches: safeMatches },
-            NETWORK_CACHE_MAX_ENTRIES
+            PLAYER_MATCHES_CACHE_MAX_ENTRIES
           );
           schedulePlayerMatchesCachePersist();
         }
         return safeMatches;
       })
       .catch((error) => {
+        if (staleCached) {
+          const ageMs = Math.max(0, Date.now() - Number(staleCached.ts || 0));
+          const fallbackMatches = rebasePlayerResultMatchesForCurrentSource(staleCached.matches)
+            .map((match) => ({
+              ...match,
+              profileCacheFallback: true,
+              profileCacheAgeMs: ageMs
+            }));
+          if (playerMatchesCache.get(cacheKey) === inFlight) {
+            setBoundedMapValue(
+              playerMatchesCache,
+              cacheKey,
+              staleCached,
+              PLAYER_MATCHES_CACHE_MAX_ENTRIES
+            );
+          }
+          return fallbackMatches;
+        }
         if (playerMatchesCache.get(cacheKey) === inFlight) {
           playerMatchesCache.delete(cacheKey);
         }
         throw error;
       });
     inFlight.promise = promise;
-    setBoundedMapValue(playerMatchesCache, cacheKey, inFlight, NETWORK_CACHE_MAX_ENTRIES);
+    setBoundedMapValue(playerMatchesCache, cacheKey, inFlight, PLAYER_MATCHES_CACHE_MAX_ENTRIES);
     return promise;
   }
 
@@ -10105,7 +10144,7 @@
         if (
           entry
           && Array.isArray(entry.matches)
-          && now - Number(entry.ts || 0) <= PLAYER_MATCHES_CACHE_TTL_MS
+          && now - Number(entry.ts || 0) <= PLAYER_MATCHES_STALE_FALLBACK_TTL_MS
         ) {
           setBoundedMapValue(
             playerMatchesCache,
@@ -10114,7 +10153,7 @@
               ...entry,
               matches: rebasePlayerResultMatchesForCurrentSource(entry.matches)
             },
-            NETWORK_CACHE_MAX_ENTRIES
+            PLAYER_MATCHES_CACHE_MAX_ENTRIES
           );
         }
       }
@@ -10137,7 +10176,7 @@
     try {
       const entries = Array.from(playerMatchesCache.entries())
         .filter(([, entry]) => entry && Array.isArray(entry.matches))
-        .slice(-NETWORK_CACHE_MAX_ENTRIES);
+        .slice(-PLAYER_MATCHES_CACHE_MAX_ENTRIES);
       if (window.localStorage) {
         const serialized = JSON.stringify({
           version: PLAYER_MATCHES_CACHE_STORAGE_VERSION,
@@ -10725,7 +10764,7 @@
       promise: null
     };
     const remainingMs = Math.max(100, getOperationRemainingMs(requestedDeadlineAt));
-    const promise = raceWithRuntimeDeadline(
+    const fetchThroughExtension = () => raceWithRuntimeDeadline(
       sendRuntimeMessage({
         type: "lvr:fetchBsportsfanText",
         url: cacheKey,
@@ -10733,14 +10772,39 @@
         cacheTtlMs: Math.max(0, Number(options.cacheTtlMs || 0) || 0),
         priority: options.requestPriority
       }),
-      remainingMs,
+      Math.max(100, getOperationRemainingMs(requestedDeadlineAt)),
       "BsportsFan text fetch"
     ).then((response) => {
       if (!response || typeof response.text !== "string") {
         throw new Error("BsportsFan proxy returned no text");
       }
       return response.text;
-    }).finally(() => {
+    });
+    const parsedUrl = parseUrl(cacheKey);
+    const canUseCurrentPageSession = Boolean(
+      parsedUrl
+      && parsedUrl.origin === location.origin
+      && isSupportedTableTennisDataHostname(parsedUrl.hostname)
+    );
+    const request = canUseCurrentPageSession
+      ? fetchTextWithCurrentPageSession(cacheKey, {
+          ...options,
+          deadlineAt: requestedDeadlineAt
+        }).catch((error) => {
+          // A confirmed 403/429 should be handled by the caller's twin-source
+          // fallback. Repeating the same blocked URL from the extension worker
+          // only wastes the short prematch decision window.
+          if (isTableTennisEndpointBlockedError(error)) {
+            throw error;
+          }
+          return fetchThroughExtension();
+        })
+      : fetchThroughExtension();
+    const promise = raceWithRuntimeDeadline(
+      request,
+      remainingMs,
+      "table-tennis text fetch"
+    ).finally(() => {
       if (fetchTextCache.get(cacheKey) === entry) {
         fetchTextCache.delete(cacheKey);
       }
@@ -10748,6 +10812,52 @@
     entry.promise = promise;
     fetchTextCache.set(cacheKey, entry);
     return promise;
+  }
+
+  async function fetchTextWithCurrentPageSession(url, options = {}) {
+    const parsedUrl = parseUrl(url);
+    if (
+      !parsedUrl
+      || parsedUrl.origin !== location.origin
+      || !isSupportedTableTennisDataHostname(parsedUrl.hostname)
+    ) {
+      throw new Error("Current page session is not available for this URL");
+    }
+    const deadlineAt = normalizeOperationDeadline(
+      options.deadlineAt,
+      BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS
+    );
+    const timeoutMs = Math.max(100, getOperationRemainingMs(deadlineAt));
+    const lease = await acquireBsportsfanRequestSlot(parsedUrl.href, options);
+    const leaseToken = normalizeText(lease && lease.token || "");
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => {
+      controller.abort(createDeadlineError("current page text fetch", timeoutMs));
+    }, timeoutMs);
+    try {
+      const response = await window.fetch(parsedUrl.href, {
+        credentials: "include",
+        cache: "no-store",
+        redirect: "follow",
+        signal: controller.signal
+      });
+      if (!response || !response.ok) {
+        const status = Number(response && response.status || 0);
+        const error = new Error(`HTTP ${status}`);
+        error.status = status;
+        error.sourceId = getTableTennisDataSourceId(parsedUrl.href);
+        if ([403, 429].includes(status)) {
+          error.code = TABLE_TENNIS_ENDPOINT_BLOCKED_CODE;
+          error.endpointBlocked = true;
+          error.retryAfterMs = INLINE_FORECAST_ERROR_RETRY_MS;
+        }
+        throw error;
+      }
+      return response.text();
+    } finally {
+      window.clearTimeout(timeoutId);
+      releaseBsportsfanRequestSlot(leaseToken);
+    }
   }
 
   function parseHtmlDocument(html) {

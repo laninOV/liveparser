@@ -333,7 +333,7 @@ function renderArchiveDashboard(rows, summary, pipelineStatus, scanStatus = null
 
   renderArchiveItems([
     ["Сбор сейчас", formatCurrentCollectorStatus(scanStatus)],
-    ["Последняя обработка", formatLatestDecision(latestDecision)],
+    ["Последнее решение", formatLatestDecision(latestDecision)],
     ["Матчей обработано", processed],
     ["Отправлено", Math.max(0, Number(acceptedPair.sent || 0))],
     ["Отброшено", Math.max(0, Number(rejectedPair.selected || 0))],
@@ -411,10 +411,14 @@ function formatCurrentCollectorStatus(scanStatus) {
     const states = cipMonitor.forecastStates && typeof cipMonitor.forecastStates === "object"
       ? cipMonitor.forecastStates
       : {};
-    const failures = Number(states.cooling || 0)
-      + Number(states.terminal || 0)
-      + Number(states.notReady || 0);
-    return `${sourceLabel} · работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · ждут старта ${Number(cipMonitor.waitingRows || 0)} · ошибок ${failures}`;
+    const activeWorkers = Math.max(0, Number(cipMonitor.forecastActiveWorkers || 0));
+    const retries = Math.max(0, Number(states.cooling || 0));
+    const profileBlocked = Array.isArray(cipMonitor.forecastErrors)
+      && cipMonitor.forecastErrors.some((entry) => /HTTP\s*(?:403|429)|profile failure/i.test(String(entry && entry.message || "")));
+    if (profileBlocked) {
+      return `${sourceLabel} · список работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · история игроков недоступна — пробую резерв`;
+    }
+    return `${sourceLabel} · работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · ждут старта ${Number(cipMonitor.waitingRows || 0)} · в работе ${activeWorkers} · повторов ${retries}`;
   }
   return snapshot.ts ? `список матчей не открыт · видно ${visibleRows}` : "нет данных";
 }
