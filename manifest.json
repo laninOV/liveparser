@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Прогноз настольного тенниса",
   "description": "Прогнозирует 2+ сета: история и PBP с причинной проверкой прематч-рынком.",
-  "version": "0.34.0",
+  "version": "0.34.1",
   "action": {
     "default_title": "Прогноз настольного тенниса",
     "default_popup": "src/popup/popup.html"
@@ -17,17 +17,13 @@
     "unlimitedStorage"
   ],
   "host_permissions": [
-    "https://*.bsportsfan.com/*",
-    "https://betsapi.com/*",
-    "https://*.betsapi.com/*",
+    "https://ru.bsportsfan.com/*",
     "https://api.telegram.org/*"
   ],
   "content_scripts": [
     {
       "matches": [
-        "https://*.bsportsfan.com/*",
-        "https://betsapi.com/*",
-        "https://*.betsapi.com/*"
+        "https://ru.bsportsfan.com/*"
       ],
       "js": [
         "src/shared/table-tennis-sources.js",
@@ -45,9 +41,7 @@
         "src/content/bsportsfan-page-bridge.js"
       ],
       "matches": [
-        "https://*.bsportsfan.com/*",
-        "https://betsapi.com/*",
-        "https://*.betsapi.com/*"
+        "https://ru.bsportsfan.com/*"
       ]
     }
   ]

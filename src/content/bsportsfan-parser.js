@@ -10,16 +10,13 @@
     "a[href*='/table-tennis/rs/']",
     "a[href^='/r/']",
     "a[href^='/rs/']",
-    "a[href*='bsportsfan.com/r/']",
-    "a[href*='bsportsfan.com/rs/']",
-    "a[href*='betsapi.com/r/']",
-    "a[href*='betsapi.com/rs/']"
+    "a[href*='ru.bsportsfan.com/r/']",
+    "a[href*='ru.bsportsfan.com/rs/']"
   ].join(",");
   const BSF_PLAYER_LINK_SELECTOR = [
     "a[href*='/table-tennis/t/']",
     "a[href^='/t/']",
-    "a[href*='bsportsfan.com/t/']",
-    "a[href*='betsapi.com/t/']"
+    "a[href*='ru.bsportsfan.com/t/']"
   ].join(",");
   const BSF_LIST_MATCH_ROW_SELECTOR = "tr, .card-hover, li";
   const UPDATE_INTERVAL_MS = 5000;
@@ -4299,11 +4296,10 @@
 
   async function fetchAndSyncTelegramPredictionResultsPage(options = {}) {
     const config = options && typeof options === "object" ? options : {};
-    let resultsUrl = rebaseTableTennisDataUrl(
+    const resultsUrl = rebaseTableTennisDataUrl(
       normalizeUrl(RESULTS_PATH, location.origin),
       location.origin
     );
-    let sourceFallbackAttempted = false;
     let html = "";
     try {
       html = await loadTelegramPredictionResultsPageInFrame(resultsUrl, {
@@ -4311,43 +4307,18 @@
         requestPriority: config.requestPriority || "background"
       });
     } catch (error) {
-      let frameError = error;
-      if (
-        isTableTennisEndpointBlockedError(error)
-        && !sourceFallbackAttempted
-        && getTableTennisDataSourceId(resultsUrl)
-      ) {
-        resultsUrl = getAlternateTableTennisDataUrl(resultsUrl);
-        sourceFallbackAttempted = true;
-      } else if (isBsportsfanProtectionError(error)) {
+      if (isBsportsfanProtectionError(error)) {
         throw error;
       }
       if (!html && config.allowFetchFallback === false) {
-        throw frameError;
+        throw error;
       }
       if (!html) {
-        try {
-          html = await fetchText(resultsUrl, {
-            cacheTtlMs: config.requestPriority === "interactive" ? 1 : 30 * 1000,
-            deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS,
-            requestPriority: config.requestPriority || "background"
-          });
-        } catch (fetchError) {
-          if (
-            !isTableTennisEndpointBlockedError(fetchError)
-            || sourceFallbackAttempted
-            || !getTableTennisDataSourceId(resultsUrl)
-          ) {
-            throw fetchError;
-          }
-          resultsUrl = getAlternateTableTennisDataUrl(resultsUrl);
-          sourceFallbackAttempted = true;
-          html = await fetchText(resultsUrl, {
-            cacheTtlMs: config.requestPriority === "interactive" ? 1 : 30 * 1000,
-            deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS,
-            requestPriority: config.requestPriority || "background"
-          });
-        }
+        html = await fetchText(resultsUrl, {
+          cacheTtlMs: config.requestPriority === "interactive" ? 1 : 30 * 1000,
+          deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS,
+          requestPriority: config.requestPriority || "background"
+        });
       }
     }
     const doc = parseHtmlDocument(html);
@@ -4792,8 +4763,7 @@
     if (!matchUrl) {
       return null;
     }
-    let sourceMatchUrl = rebaseTableTennisDataUrl(matchUrl, location.origin);
-    let sourceFallbackAttempted = false;
+    const sourceMatchUrl = rebaseTableTennisDataUrl(matchUrl, location.origin);
     const sourceRow = sourceMatchUrl === matchUrl
       ? row
       : { ...row, matchUrl: sourceMatchUrl };
@@ -4807,62 +4777,22 @@
           return frameResult;
         }
       } catch (error) {
-        if (
-          isTableTennisEndpointBlockedError(error)
-          && !sourceFallbackAttempted
-          && getTableTennisDataSourceId(sourceMatchUrl)
-        ) {
-          sourceMatchUrl = getAlternateTableTennisDataUrl(sourceMatchUrl);
-          sourceFallbackAttempted = true;
-        } else if (isBsportsfanProtectionError(error)) {
+        if (isBsportsfanProtectionError(error)) {
           throw error;
         }
       }
     }
-    let html = "";
-    try {
-      html = await fetchText(sourceMatchUrl, {
-        cacheTtlMs: 1,
-        deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS,
-        requestPriority: options.requestPriority || "background"
-      });
-    } catch (error) {
-      if (
-        !isTableTennisEndpointBlockedError(error)
-        || sourceFallbackAttempted
-        || !getTableTennisDataSourceId(sourceMatchUrl)
-      ) {
-        throw error;
-      }
-      sourceMatchUrl = getAlternateTableTennisDataUrl(sourceMatchUrl);
-      sourceFallbackAttempted = true;
-      html = await fetchText(sourceMatchUrl, {
-        cacheTtlMs: 1,
-        deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS,
-        requestPriority: options.requestPriority || "background"
-      });
-    }
-    const doc = new DOMParser().parseFromString(html, "text/html");
-    const parsed = parseTelegramPredictionFinalResultDocument(
-      doc,
-      sourceMatchUrl,
-      row,
-      "match-page-backfill"
-    );
-    if (parsed || sourceFallbackAttempted || !getTableTennisDataSourceId(sourceMatchUrl)) {
-      return parsed;
-    }
-    const fallbackUrl = getAlternateTableTennisDataUrl(sourceMatchUrl);
-    const fallbackHtml = await fetchText(fallbackUrl, {
+    const html = await fetchText(sourceMatchUrl, {
       cacheTtlMs: 1,
       deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS,
       requestPriority: options.requestPriority || "background"
     });
+    const doc = new DOMParser().parseFromString(html, "text/html");
     return parseTelegramPredictionFinalResultDocument(
-      new DOMParser().parseFromString(fallbackHtml, "text/html"),
-      fallbackUrl,
+      doc,
+      sourceMatchUrl,
       row,
-      "match-page-source-fallback"
+      "match-page-backfill"
     );
   }
 
@@ -9669,28 +9599,17 @@
 
   async function fetchBsportsfanSnapshotUncached(url, options = {}) {
     let frameError = "";
-    if (options.sourceFallbackAttempted !== true) {
-      try {
-        const frameSnapshot = await loadBsportsfanSnapshotInFrame(url, options);
-        if (isUsableMatchSnapshot(frameSnapshot)) {
-          return frameSnapshot;
-        }
-        frameError = describeMissingGraph(frameSnapshot, null);
-      } catch (error) {
-        if (
-          isTableTennisEndpointBlockedError(error)
-          && getTableTennisDataSourceId(url)
-        ) {
-          return fetchBsportsfanSnapshotUncached(
-            getAlternateTableTennisDataUrl(url),
-            { ...options, sourceFallbackAttempted: true }
-          );
-        }
-        if (isBsportsfanProtectionError(error)) {
-          throw error;
-        }
-        frameError = stringifyError(error);
+    try {
+      const frameSnapshot = await loadBsportsfanSnapshotInFrame(url, options);
+      if (isUsableMatchSnapshot(frameSnapshot)) {
+        return frameSnapshot;
       }
+      frameError = describeMissingGraph(frameSnapshot, null);
+    } catch (error) {
+      if (isBsportsfanProtectionError(error)) {
+        throw error;
+      }
+      frameError = stringifyError(error);
     }
 
     try {
@@ -9712,15 +9631,6 @@
       }
       throw new Error(describeMissingGraph(snapshot, doc));
     } catch (error) {
-      if (
-        options.sourceFallbackAttempted !== true
-        && getTableTennisDataSourceId(url)
-      ) {
-        return fetchBsportsfanSnapshotUncached(
-          getAlternateTableTennisDataUrl(url),
-          { ...options, sourceFallbackAttempted: true }
-        );
-      }
       if (isBsportsfanProtectionError(error)) {
         throw error;
       }
@@ -9744,28 +9654,17 @@
 
   async function fetchBsportsfanPageSnapshotUncached(url, options = {}) {
     let frameError = "";
-    if (options.sourceFallbackAttempted !== true) {
-      try {
-        const frameSnapshot = await loadBsportsfanPageSnapshotInFrame(url, options);
-        if (isUsableForecastSeedSnapshot(frameSnapshot)) {
-          return frameSnapshot;
-        }
-        frameError = describeMissingPlayers(frameSnapshot);
-      } catch (error) {
-        if (
-          isTableTennisEndpointBlockedError(error)
-          && getTableTennisDataSourceId(url)
-        ) {
-          return fetchBsportsfanPageSnapshotUncached(
-            getAlternateTableTennisDataUrl(url),
-            { ...options, sourceFallbackAttempted: true }
-          );
-        }
-        if (isBsportsfanProtectionError(error)) {
-          throw error;
-        }
-        frameError = stringifyError(error);
+    try {
+      const frameSnapshot = await loadBsportsfanPageSnapshotInFrame(url, options);
+      if (isUsableForecastSeedSnapshot(frameSnapshot)) {
+        return frameSnapshot;
       }
+      frameError = describeMissingPlayers(frameSnapshot);
+    } catch (error) {
+      if (isBsportsfanProtectionError(error)) {
+        throw error;
+      }
+      frameError = stringifyError(error);
     }
 
     try {
@@ -9787,15 +9686,6 @@
       }
       throw new Error(describeMissingPlayers(snapshot));
     } catch (error) {
-      if (
-        options.sourceFallbackAttempted !== true
-        && getTableTennisDataSourceId(url)
-      ) {
-        return fetchBsportsfanPageSnapshotUncached(
-          getAlternateTableTennisDataUrl(url),
-          { ...options, sourceFallbackAttempted: true }
-        );
-      }
       if (isBsportsfanProtectionError(error)) {
         throw error;
       }
@@ -9865,16 +9755,6 @@
           };
         }
       } catch (error) {
-        if (
-          isTableTennisEndpointBlockedError(error)
-          && context.sourceFallbackAttempted !== true
-          && getTableTennisDataSourceId(oddsUrl)
-        ) {
-          return fetchBsportsfanOddsMarketUncached(
-            getAlternateTableTennisDataUrl(oddsUrl),
-            { ...context, sourceFallbackAttempted: true, allowIframe: false }
-          );
-        }
         if (isBsportsfanProtectionError(error)) {
           throw error;
         }
@@ -9906,16 +9786,6 @@
         return fetchMarket;
       }
     } catch (error) {
-      if (
-        isTableTennisEndpointBlockedError(error)
-        && context.sourceFallbackAttempted !== true
-        && getTableTennisDataSourceId(oddsUrl)
-      ) {
-        return fetchBsportsfanOddsMarketUncached(
-          getAlternateTableTennisDataUrl(oddsUrl),
-          { ...context, sourceFallbackAttempted: true, allowIframe: false }
-        );
-      }
       if (isBsportsfanProtectionError(error)) {
         throw error;
       }
@@ -9935,15 +9805,6 @@
     }
 
     if (context && context.allowIframe === false) {
-      if (
-        context.sourceFallbackAttempted !== true
-        && getTableTennisDataSourceId(oddsUrl)
-      ) {
-        return fetchBsportsfanOddsMarketUncached(
-          getAlternateTableTennisDataUrl(oddsUrl),
-          { ...context, sourceFallbackAttempted: true, allowIframe: false }
-        );
-      }
       return fetchMarket || {
         source: "bsportsfan-odds",
         status: "missing",
@@ -9969,16 +9830,6 @@
       last: null,
       rows: []
     };
-    if (
-      market.status !== "ready"
-      && context.sourceFallbackAttempted !== true
-      && getTableTennisDataSourceId(oddsUrl)
-    ) {
-      return fetchBsportsfanOddsMarketUncached(
-        getAlternateTableTennisDataUrl(oddsUrl),
-        { ...context, sourceFallbackAttempted: true, allowIframe: false }
-      );
-    }
     return market;
   }
 
@@ -10135,9 +9986,8 @@
   async function fetchPlayerResultMatches(url, options = {}) {
     ensurePlayerMatchesCacheLoaded();
     const cacheKey = getCanonicalTableTennisPlayerCacheKey(url);
-    // Player profiles always start on the source that owns the collector tab.
-    // A failed attempt may use the twin host once, but it never changes the
-    // routing of later matches.
+    // Player profiles always use the Russian BSportsFan collector origin.
+    // Legacy archive URLs are normalized before any network request.
     const sourceUrl = rebaseTableTennisDataUrl(url, location.origin);
     const cached = playerMatchesCache.get(cacheKey);
     if (
@@ -10319,16 +10169,6 @@
         }
         frameError = "results 0";
       } catch (error) {
-        if (
-          isTableTennisEndpointBlockedError(error)
-          && options.sourceFallbackAttempted !== true
-          && getTableTennisDataSourceId(url)
-        ) {
-          return fetchPlayerResultMatchesUncached(
-            getAlternateTableTennisDataUrl(url),
-            { ...options, sourceFallbackAttempted: true, allowIframe: false }
-          );
-        }
         if (isBsportsfanProtectionError(error)) {
           throw error;
         }
@@ -10358,13 +10198,7 @@
       }
       fetchError = `results 0, title ${normalizeText(doc.title || "-")}`;
     } catch (error) {
-      if (
-        isTableTennisEndpointBlockedError(error)
-        && options.sourceFallbackAttempted !== true
-        && getTableTennisDataSourceId(url)
-      ) {
-        fetchError = stringifyError(error);
-      } else if (isBsportsfanProtectionError(error)) {
+      if (isBsportsfanProtectionError(error)) {
         throw error;
       } else {
         fetchError = stringifyError(error);
@@ -10372,25 +10206,7 @@
     }
 
     if (options.allowIframe === false) {
-      if (
-        options.sourceFallbackAttempted !== true
-        && getTableTennisDataSourceId(url)
-      ) {
-        return fetchPlayerResultMatchesUncached(
-          getAlternateTableTennisDataUrl(url),
-          { ...options, sourceFallbackAttempted: true, allowIframe: false }
-        );
-      }
       throw createBsportsfanProfileUnavailableError(`fetch ${fetchError}`);
-    }
-    if (
-      options.sourceFallbackAttempted !== true
-      && getTableTennisDataSourceId(url)
-    ) {
-      return fetchPlayerResultMatchesUncached(
-        getAlternateTableTennisDataUrl(url),
-        { ...options, sourceFallbackAttempted: true, allowIframe: false }
-      );
     }
     throw createBsportsfanProfileUnavailableError(
       `iframe ${frameError || "results 0"}; fetch ${fetchError || "results 0"}`
@@ -10881,9 +10697,9 @@
           ...options,
           deadlineAt: requestedDeadlineAt
         }).catch((error) => {
-          // A confirmed 403/429 should be handled by the caller's twin-source
-          // fallback. Repeating the same blocked URL from the extension worker
-          // only wastes the short prematch decision window.
+          // A confirmed 403/429 should be handled by the caller's recovery
+          // path. Repeating the same blocked URL from the extension worker only
+          // wastes the short prematch decision window.
           if (isTableTennisEndpointBlockedError(error)) {
             throw error;
           }
@@ -11923,11 +11739,19 @@
   function rebaseTableTennisDataUrl(value, targetOrigin = location.origin) {
     const url = parseUrl(value);
     const target = parseUrl(targetOrigin);
+    const sourceIsRussianBsportsfan = Boolean(
+      url && isSupportedTableTennisDataHostname(url.hostname)
+    );
+    const sourceIsLegacyArchiveUrl = Boolean(
+      url
+      && isLegacyTableTennisArchiveHostname(url.hostname)
+      && /^\/(?:table-tennis\/)?(?:r|rs|t)\/\d+(?:\/|$)/i.test(url.pathname)
+    );
     if (
       !url
       || !target
-      || !isSupportedTableTennisDataHostname(url.hostname)
       || !isSupportedTableTennisDataHostname(target.hostname)
+      || (!sourceIsRussianBsportsfan && !sourceIsLegacyArchiveUrl)
     ) {
       return normalizeUrl(value);
     }
@@ -11936,27 +11760,16 @@
     return normalizeUrl(url.href);
   }
 
-  function getAlternateTableTennisDataUrl(value) {
-    const url = normalizeUrl(value || "");
-    const sourceId = getTableTennisDataSourceId(url);
-    if (!url || !sourceId) {
-      return url;
-    }
-    const alternateSourceId = TABLE_TENNIS_SOURCE_API.getAlternateSourceId(sourceId);
-    return rebaseTableTennisDataUrl(
-      url,
-      TABLE_TENNIS_SOURCE_API.getOrigin(alternateSourceId)
-    );
+  function isLegacyTableTennisArchiveHostname(value) {
+    const hostname = normalizeText(value || "").toLowerCase();
+    return hostname === "betsapi.com"
+      || hostname.endsWith(".betsapi.com")
+      || hostname === "bsportsfan.com"
+      || hostname.endsWith(".bsportsfan.com");
   }
 
   function getCurrentTableTennisSourceId() {
     return getTableTennisDataSourceId(location.href) || "bsportsfan";
-  }
-
-  function getFallbackTableTennisOrigin() {
-    return TABLE_TENNIS_SOURCE_API.getOrigin(
-      TABLE_TENNIS_SOURCE_API.getAlternateSourceId(getCurrentTableTennisSourceId())
-    );
   }
 
   function isCurrentTableTennisSourcePageHealthy(doc = document) {
@@ -12124,10 +11937,9 @@
         tableTennisSourceFailoverStarted = false;
         return;
       }
-      stopTableTennisCollectorWork("data-source-failover");
-      if (!navigateToTableTennisSource(getFallbackTableTennisOrigin(), reason)) {
-        tableTennisSourceFailoverStarted = false;
-      }
+      stopTableTennisCollectorWork("data-source-recovery");
+      tableTennisSourceFailoverStarted = false;
+      window.setTimeout(() => window.location.reload(), 60 * 1000);
     });
     return true;
   }
@@ -12250,7 +12062,7 @@
   }
 
   function getBsportsfanOddsUrl(value) {
-    const url = parseUrl(value);
+    const url = parseUrl(rebaseTableTennisDataUrl(value, location.origin));
     if (!url || !isSupportedTableTennisDataHostname(url.hostname)) {
       return "";
     }

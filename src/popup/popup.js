@@ -342,7 +342,7 @@ function renderArchiveDashboard(rows, summary, pipelineStatus, scanStatus = null
     ["Игр в архиве", list.length],
     ["Стартовые кэфы", `${openingOddsRows}/${list.length}`],
     ["Всего итогов", resultRows],
-    ["Источники данных", formatTableTennisNetworkStatus(pipelineStatus && pipelineStatus.tableTennisNetwork)]
+    ["Источник данных", formatTableTennisNetworkStatus(pipelineStatus && pipelineStatus.tableTennisNetwork)]
   ]);
 }
 
@@ -371,12 +371,7 @@ function hasArchivedOpeningOdds(row) {
 
 function formatCurrentCollectorStatus(scanStatus) {
   const snapshot = scanStatus && scanStatus.bsportsfan || {};
-  const dataSource = String(snapshot.dataSource || snapshot.cipMonitor && snapshot.cipMonitor.sourceId || "");
-  const sourceLabel = dataSource === "betsapi"
-    ? "BetsAPI"
-    : dataSource === "bsportsfan"
-      ? "BSportsFan"
-      : "источник";
+  const sourceLabel = "BSportsFan";
   const recovery = snapshot.sessionRecovery && typeof snapshot.sessionRecovery === "object"
     ? snapshot.sessionRecovery
     : null;
@@ -384,7 +379,7 @@ function formatCurrentCollectorStatus(scanStatus) {
     if (String(recovery.stage || "") === "manual-required") {
       return `остановлено — восстанавливаю ${sourceLabel}`;
     }
-    return `переключаю ${sourceLabel}`;
+    return `восстанавливаю ${sourceLabel}`;
   }
   if (
     String(scanStatus && scanStatus.statusKind || "") === "protection"
@@ -419,7 +414,7 @@ function formatCurrentCollectorStatus(scanStatus) {
     const profileBlocked = Array.isArray(cipMonitor.forecastErrors)
       && cipMonitor.forecastErrors.some((entry) => /HTTP\s*(?:403|429)|profile failure/i.test(String(entry && entry.message || "")));
     if (profileBlocked) {
-      return `${sourceLabel} · список работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · история игроков недоступна — пробую резерв`;
+      return `${sourceLabel} · список работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · история игроков недоступна — повторяю подключение`;
     }
     return `${sourceLabel} · работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · ждут старта ${Number(cipMonitor.waitingRows || 0)} · в работе ${activeForecasts} · повторов ${retries}`;
   }
@@ -431,14 +426,9 @@ function formatTableTennisNetworkStatus(network) {
   const active = Math.max(0, Number(snapshot.active || 0));
   const queued = Math.max(0, Number(snapshot.queued || 0));
   const protectionOpenUntil = Number(snapshot.protectionOpenUntil || 0);
-  const activeSource = String(snapshot.activeSourceId || "");
-  const sourceLabel = activeSource === "betsapi"
-    ? "BetsAPI"
-    : activeSource === "bsportsfan"
-      ? "BSportsFan"
-      : "источник определяется";
+  const sourceLabel = "BSportsFan";
   if (protectionOpenUntil > Date.now()) {
-    return `оба недоступны до ${formatDateTime(protectionOpenUntil)}`;
+    return `BSportsFan недоступен до ${formatDateTime(protectionOpenUntil)}`;
   }
   return `${sourceLabel} · активно ${active} · ждут ${queued}`;
 }

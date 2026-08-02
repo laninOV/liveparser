@@ -106,6 +106,7 @@ const TABLE_TENNIS_ENDPOINT_BLOCKED_CODE = "table-tennis-endpoint-blocked";
 const TABLE_TENNIS_ENDPOINT_BLOCKED_RETRY_MS = 5 * 60 * 1000;
 const TABLE_TENNIS_SOURCE_API = globalThis.LvrTableTennisSources;
 const TABLE_TENNIS_SOURCE_ORIGINS = TABLE_TENNIS_SOURCE_API.ORIGINS;
+const TABLE_TENNIS_SOURCE_IDS = TABLE_TENNIS_SOURCE_API.SOURCE_IDS;
 const TABLE_TENNIS_TAB_URL_PATTERNS = TABLE_TENNIS_SOURCE_API.TAB_URL_PATTERNS;
 const getTableTennisDataSourceId = TABLE_TENNIS_SOURCE_API.getSourceId;
 const isSupportedTableTennisDataHostname = TABLE_TENNIS_SOURCE_API.isSupportedHostname;
@@ -142,10 +143,9 @@ const bsportsfanProxyFetchInFlight = new Map();
 const bsportsfanProxyResponseCache = new Map();
 let bsportsfanProxyFetchActive = 0;
 let bsportsfanProxyFetchLastStartedAt = 0;
-const tableTennisSourceLastStartedAt = {
-  betsapi: 0,
-  bsportsfan: 0
-};
+const tableTennisSourceLastStartedAt = Object.fromEntries(
+  TABLE_TENNIS_SOURCE_IDS.map((sourceId) => [sourceId, 0])
+);
 let bsportsfanProxyFetchDrainTimer = 0;
 let bsportsfanProxyFetchSequence = 0;
 const bsportsfanProxyFetchMetrics = {
@@ -161,10 +161,9 @@ const bsportsfanProxyFetchMetrics = {
 };
 let tableTennisProtectionStateLoaded = false;
 let tableTennisProtectionStatePromise = null;
-const tableTennisProtectionCircuits = {
-  betsapi: { openUntil: 0, reason: "" },
-  bsportsfan: { openUntil: 0, reason: "" }
-};
+const tableTennisProtectionCircuits = Object.fromEntries(
+  TABLE_TENNIS_SOURCE_IDS.map((sourceId) => [sourceId, { openUntil: 0, reason: "" }])
+);
 let bsportsfanResultBackfillLeaseUntil = 0;
 let bsportsfanResultBackfillLeaseOwner = "";
 let bsportsfanResultBackfillLeaseToken = "";
@@ -293,17 +292,19 @@ async function runTableTennisHealthWatchdogNow(now = Date.now()) {
     ? storage[TABLE_TENNIS_HEALTH_WATCHDOG_STORAGE_KEY]
     : {};
   await reconcileTableTennisSourceHealthFromScanStatus(scanStatus, now).catch(() => {});
-  const betsapiCircuitError = getTableTennisProtectionCircuitError("betsapi", now);
-  const bsportsfanCircuitError = getTableTennisProtectionCircuitError("bsportsfan", now);
-  const bothSourcesProtected = Boolean(betsapiCircuitError && bsportsfanCircuitError);
-  if (bothSourcesProtected) {
+  const protectionErrors = Object.fromEntries(TABLE_TENNIS_SOURCE_IDS.map((sourceId) => [
+    sourceId,
+    getTableTennisProtectionCircuitError(sourceId, now)
+  ]));
+  const allSourcesProtected = TABLE_TENNIS_SOURCE_IDS.every((sourceId) => (
+    Boolean(protectionErrors[sourceId])
+  ));
+  if (allSourcesProtected) {
     const sourceState = await getTableTennisSourceState().catch(() => null);
-    const lastFailureAt = Math.max(
-      Number(sourceState && sourceState.sources && sourceState.sources.betsapi
-        && sourceState.sources.betsapi.lastFailureAt || 0),
-      Number(sourceState && sourceState.sources && sourceState.sources.bsportsfan
-        && sourceState.sources.bsportsfan.lastFailureAt || 0)
-    );
+    const lastFailureAt = Math.max(0, ...TABLE_TENNIS_SOURCE_IDS.map((sourceId) => Number(
+      sourceState && sourceState.sources && sourceState.sources[sourceId]
+        && sourceState.sources[sourceId].lastFailureAt || 0
+    )));
     const lastProtectedProbeAt = Number(previous.lastProtectedProbeAt || 0);
     if (
       now - Math.max(lastFailureAt, lastProtectedProbeAt)
@@ -376,11 +377,11 @@ async function runTableTennisHealthWatchdogNow(now = Date.now()) {
         || sourceRank(left) - sourceRank(right)
         || Number(Boolean(right && right.active)) - Number(Boolean(left && left.active));
     });
-  const candidates = bothSourcesProtected
+  const candidates = allSourcesProtected
     ? allCandidates
     : allCandidates.filter((tab) => {
         const sourceId = getTableTennisDataSourceId(tab && tab.url || "");
-        return sourceId === "betsapi" ? !betsapiCircuitError : !bsportsfanCircuitError;
+        return Boolean(sourceId && !protectionErrors[sourceId]);
       });
   const collectorLease = await getTableTennisCollectorLease().catch(() => null);
   const leaderTabId = Number(collectorLease && collectorLease.tabId);
@@ -407,7 +408,7 @@ async function runTableTennisHealthWatchdogNow(now = Date.now()) {
       progressSignature: progress.signature,
       progressObservedAt: now,
       activeWork: progress.active,
-      lastProtectedProbeAt: bothSourcesProtected
+      lastProtectedProbeAt: allSourcesProtected
         ? now
         : Number(previous.lastProtectedProbeAt || 0),
       updatedAt: now
@@ -417,7 +418,7 @@ async function runTableTennisHealthWatchdogNow(now = Date.now()) {
   return {
     reloaded: true,
     tabId: tab.id,
-    reason: bothSourcesProtected
+    reason: allSourcesProtected
       ? "protected-source-revalidation"
       : heartbeatStale
         ? "heartbeat-stalled"
@@ -1597,8 +1598,8 @@ function notifyBsportsfanAttention(value = {}, sender = null) {
   return operation;
 }
 
-function areBothTableTennisSourcesUnavailable(sourceState, now = Date.now()) {
-  return ["betsapi", "bsportsfan"].every((sourceId) => {
+function areAllTableTennisSourcesUnavailable(sourceState, now = Date.now()) {
+  return TABLE_TENNIS_SOURCE_IDS.every((sourceId) => {
     const source = sourceState && sourceState.sources && sourceState.sources[sourceId] || {};
     return Number(source.cooldownUntil || 0) > now
       && normalizeTelegramText(source.lastObservationKind || "") === "failure";
@@ -1626,8 +1627,8 @@ async function notifyBsportsfanAttentionNow(value = {}, sender = null) {
   });
   await reconcileTableTennisSourceHealthFromScanStatus(stored.scanStatus, now).catch(() => {});
   const sourceState = await getTableTennisSourceState();
-  const bothUnavailable = areBothTableTennisSourcesUnavailable(sourceState, now);
-  if (!bothUnavailable) {
+  const allUnavailable = areAllTableTennisSourcesUnavailable(sourceState, now);
+  if (!allUnavailable) {
     await chrome.storage.local.remove(BSPORTSFAN_ATTENTION_NOTIFICATION_KEY).catch(() => {});
     return {
       notified: false,
@@ -1652,7 +1653,7 @@ async function notifyBsportsfanAttentionNow(value = {}, sender = null) {
   const latestStored = await chrome.storage.local.get({ scanStatus: null });
   await reconcileTableTennisSourceHealthFromScanStatus(latestStored.scanStatus).catch(() => {});
   const latestSourceState = await getTableTennisSourceState();
-  if (!areBothTableTennisSourcesUnavailable(latestSourceState)) {
+  if (!areAllTableTennisSourcesUnavailable(latestSourceState)) {
     await chrome.storage.local.remove(BSPORTSFAN_ATTENTION_NOTIFICATION_KEY).catch(() => {});
     return {
       notified: false,
@@ -1662,14 +1663,14 @@ async function notifyBsportsfanAttentionNow(value = {}, sender = null) {
   const sessionExpired = kind === "session-expired";
   const text = sessionExpired
     ? [
-        "🟠 <b>Источники данных временно недоступны</b>",
-        "Автоматическое переключение и повторное подключение уже включены.",
+        "🟠 <b>BSportsFan временно недоступен</b>",
+        "Автоматическое повторное подключение уже включено.",
         "Если сбор не восстановится, проверьте открытую вкладку сайта."
       ].join("\n")
     : [
-        "🔴 <b>Оба источника данных временно недоступны</b>",
+        "🔴 <b>BSportsFan временно недоступен</b>",
         "Расширение остановило запросы и повторит подключение автоматически.",
-        "Ручное действие потребуется только если оба сайта продолжат показывать CAPTCHA."
+        "Ручное действие потребуется только если сайт продолжит показывать CAPTCHA."
       ].join("\n");
   const result = await sendTelegramMessage(text, settings);
   await chrome.storage.local.set({
@@ -2256,7 +2257,7 @@ function getTableTennisProtectionCircuitError(sourceId = "bsportsfan", now = Dat
     return null;
   }
   const error = createServiceWorkerError(
-    `${normalizedSourceId === "betsapi" ? "BetsAPI" : "BSportsFan"} protection cooldown active for ${Math.ceil(retryAfterMs / 1000)}s`,
+    `BSportsFan protection cooldown active for ${Math.ceil(retryAfterMs / 1000)}s`,
     "bsportsfan-circuit-open"
   );
   error.sourceId = normalizedSourceId;
@@ -2333,8 +2334,8 @@ async function fetchBsportsfanText(value, options = {}) {
       error.status = status;
       if (protectionResponse) {
         // A blocked auxiliary profile/PBP request does not prove that the
-        // visible live page is unavailable. Let the collector try the twin
-        // source without shutting down or navigating away from a healthy page.
+        // visible live page is unavailable. Keep the healthy collector page
+        // open and let the request retry after a short endpoint cooldown.
         error.endpointBlocked = true;
         error.retryAfterMs = TABLE_TENNIS_ENDPOINT_BLOCKED_RETRY_MS;
       }
@@ -2404,30 +2405,22 @@ function isBsportsfanLiveSessionExpiredResponse(value) {
 }
 
 function createDefaultTableTennisSourceState() {
+  const createSource = () => ({
+    cooldownUntil: 0,
+    failureCount: 0,
+    lastFailureAt: 0,
+    lastHealthyAt: 0,
+    lastObservationAt: 0,
+    lastObservationKind: "",
+    reason: ""
+  });
   return {
     version: 2,
-    activeSourceId: "",
+    activeSourceId: TABLE_TENNIS_SOURCE_IDS[0] || "",
     updatedAt: 0,
-    sources: {
-      betsapi: {
-        cooldownUntil: 0,
-        failureCount: 0,
-        lastFailureAt: 0,
-        lastHealthyAt: 0,
-        lastObservationAt: 0,
-        lastObservationKind: "",
-        reason: ""
-      },
-      bsportsfan: {
-        cooldownUntil: 0,
-        failureCount: 0,
-        lastFailureAt: 0,
-        lastHealthyAt: 0,
-        lastObservationAt: 0,
-        lastObservationKind: "",
-        reason: ""
-      }
-    }
+    sources: Object.fromEntries(
+      TABLE_TENNIS_SOURCE_IDS.map((sourceId) => [sourceId, createSource()])
+    )
   };
 }
 
@@ -2475,10 +2468,9 @@ function normalizeTableTennisSourceState(value) {
     version: 2,
     activeSourceId,
     updatedAt: Math.max(0, Number(raw.updatedAt || 0) || 0),
-    sources: {
-      betsapi: normalizeSource("betsapi"),
-      bsportsfan: normalizeSource("bsportsfan")
-    }
+    sources: Object.fromEntries(
+      TABLE_TENNIS_SOURCE_IDS.map((sourceId) => [sourceId, normalizeSource(sourceId)])
+    )
   };
 }
 
@@ -2562,10 +2554,6 @@ function markTableTennisSourceFailure(sourceId, options = {}) {
     source.lastObservationAt = observedAt;
     source.lastObservationKind = "failure";
     source.reason = normalizeTelegramText(options.reason || "source-unavailable");
-    const fallbackId = TABLE_TENNIS_SOURCE_API.getAlternateSourceId(sourceId);
-    if (Number(state.sources[fallbackId].cooldownUntil || 0) <= now) {
-      state.activeSourceId = fallbackId;
-    }
     return state;
   }).then((state) => {
     if (applied) {
@@ -2809,10 +2797,10 @@ function buildTableTennisSourceRoute(stateValue, options = {}) {
     shouldSwitch: Boolean(targetSourceId && currentSourceId && targetSourceId !== currentSourceId),
     allUnavailable: !targetSourceId,
     retryAt: Number.isFinite(retryAt) ? retryAt : 0,
-    sources: {
-      betsapi: { ...state.sources.betsapi },
-      bsportsfan: { ...state.sources.bsportsfan }
-    }
+    sources: Object.fromEntries(TABLE_TENNIS_SOURCE_IDS.map((sourceId) => [
+      sourceId,
+      { ...state.sources[sourceId] }
+    ]))
   };
 }
 
@@ -7521,11 +7509,10 @@ function buildTelegramCollectorHealth(scanStatus, now = Date.now()) {
     };
   }
   const bsportsfanRetryAt = getTableTennisSourceProtectionOpenUntil("bsportsfan");
-  const betsapiRetryAt = getTableTennisSourceProtectionOpenUntil("betsapi");
-  if (bsportsfanRetryAt > now && betsapiRetryAt > now) {
+  if (bsportsfanRetryAt > now) {
     return {
       state: "cooldown",
-      text: `⏸ Сбор: оба источника на паузе до ${formatTelegramStatsTime(Math.min(bsportsfanRetryAt, betsapiRetryAt))}`
+      text: `⏸ Сбор: BSportsFan на паузе до ${formatTelegramStatsTime(bsportsfanRetryAt)}`
     };
   }
   const heartbeatAt = Number(safeStatus.ts || 0);
@@ -9026,14 +9013,11 @@ async function getTelegramPipelineStatus() {
       active: bsportsfanProxyFetchActive,
       queued: bsportsfanProxyFetchQueue.length,
       inFlightUrls: bsportsfanProxyFetchInFlight.size,
-      protectionOpenUntil: (
-        Number(sourceState.sources.betsapi.cooldownUntil || 0) > Date.now()
-        && Number(sourceState.sources.bsportsfan.cooldownUntil || 0) > Date.now()
-      )
-        ? Math.min(
-            Number(sourceState.sources.betsapi.cooldownUntil || 0),
-            Number(sourceState.sources.bsportsfan.cooldownUntil || 0)
-          )
+      protectionOpenUntil: Number(
+        sourceState.sources.bsportsfan
+        && sourceState.sources.bsportsfan.cooldownUntil || 0
+      ) > Date.now()
+        ? Number(sourceState.sources.bsportsfan.cooldownUntil || 0)
         : 0,
       protectionReason: "",
       activeSourceId: sourceState.activeSourceId,
