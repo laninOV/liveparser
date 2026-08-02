@@ -77,7 +77,7 @@ document.addEventListener("DOMContentLoaded", () => {
     extensionReload.addEventListener("click", reloadExtension);
   }
   setBadge("готов", "ok");
-  setStatus("Готов к расчету", "Открой матч bsportsfan и нажми «Прогноз».");
+  setStatus("Готов к расчёту", "Сбор и переключение источников работают автоматически.");
   if (forecastPanel) {
     forecastPanel.hidden = true;
   }
@@ -341,7 +341,7 @@ function renderArchiveDashboard(rows, summary, pipelineStatus, scanStatus = null
     ["Игр в архиве", list.length],
     ["Стартовые кэфы", `${openingOddsRows}/${list.length}`],
     ["Всего итогов", resultRows],
-    ["Связь с BSportsFan", formatBsportsfanNetworkStatus(pipelineStatus && pipelineStatus.bsportsfanNetwork)]
+    ["Источники данных", formatBsportsfanNetworkStatus(pipelineStatus && pipelineStatus.bsportsfanNetwork)]
   ]);
 }
 
@@ -370,20 +370,26 @@ function hasArchivedOpeningOdds(row) {
 
 function formatCurrentCollectorStatus(scanStatus) {
   const snapshot = scanStatus && scanStatus.bsportsfan || {};
+  const dataSource = String(snapshot.dataSource || snapshot.cipMonitor && snapshot.cipMonitor.sourceId || "");
+  const sourceLabel = dataSource === "betsapi"
+    ? "BetsAPI"
+    : dataSource === "bsportsfan"
+      ? "BSportsFan"
+      : "источник";
   const recovery = snapshot.sessionRecovery && typeof snapshot.sessionRecovery === "object"
     ? snapshot.sessionRecovery
     : null;
   if (recovery && recovery.active) {
     if (String(recovery.stage || "") === "manual-required") {
-      return "остановлено — откройте BSportsFan и восстановите сессию";
+      return `остановлено — восстанавливаю ${sourceLabel}`;
     }
-    return "восстанавливаю сессию BSportsFan";
+    return `переключаю ${sourceLabel}`;
   }
   if (
     String(scanStatus && scanStatus.source || "") === "bsportsfan-protection"
     || snapshot.challenge === true
   ) {
-    return "проверка безопасности BSportsFan — откройте вкладку сайта";
+    return `защита ${sourceLabel} — переключаю источник`;
   }
   const cipMonitor = snapshot.cipMonitor && typeof snapshot.cipMonitor === "object"
     ? snapshot.cipMonitor
@@ -399,7 +405,7 @@ function formatCurrentCollectorStatus(scanStatus) {
     ? Math.max(0, Math.floor((Date.now() - lastSeenAt) / 1000))
     : null;
   if (ageSeconds !== null && ageSeconds > 30) {
-    return `нет обновлений ${ageSeconds} сек. — проверьте вкладку BSportsFan`;
+    return `нет обновлений ${ageSeconds} сек. — включено автовосстановление`;
   }
   if (cipMonitor && cipMonitor.active) {
     const states = cipMonitor.forecastStates && typeof cipMonitor.forecastStates === "object"
@@ -408,7 +414,7 @@ function formatCurrentCollectorStatus(scanStatus) {
     const failures = Number(states.cooling || 0)
       + Number(states.terminal || 0)
       + Number(states.notReady || 0);
-    return `работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · ждут старта ${Number(cipMonitor.waitingRows || 0)} · ошибок ${failures}`;
+    return `${sourceLabel} · работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · ждут старта ${Number(cipMonitor.waitingRows || 0)} · ошибок ${failures}`;
   }
   return snapshot.ts ? `список матчей не открыт · видно ${visibleRows}` : "нет данных";
 }
@@ -417,12 +423,17 @@ function formatBsportsfanNetworkStatus(network) {
   const snapshot = network && typeof network === "object" ? network : {};
   const active = Math.max(0, Number(snapshot.active || 0));
   const queued = Math.max(0, Number(snapshot.queued || 0));
-  const metrics = snapshot.metrics && typeof snapshot.metrics === "object" ? snapshot.metrics : {};
   const protectionOpenUntil = Number(snapshot.protectionOpenUntil || 0);
+  const activeSource = String(snapshot.activeSourceId || "");
+  const sourceLabel = activeSource === "betsapi"
+    ? "BetsAPI основной"
+    : activeSource === "bsportsfan"
+      ? "BSportsFan резерв"
+      : "источник определяется";
   if (protectionOpenUntil > Date.now()) {
-    return `пауза защиты до ${formatDateTime(protectionOpenUntil)} · очередь очищена`;
+    return `оба недоступны до ${formatDateTime(protectionOpenUntil)}`;
   }
-  return `активно ${active} · ждут ${queued} · объединено ${Number(metrics.coalesced || 0)} · повышено ${Number(metrics.reprioritized || 0)}`;
+  return `${sourceLabel} · активно ${active} · ждут ${queued}`;
 }
 
 function renderArchiveItems(items) {
@@ -517,7 +528,7 @@ async function backfillArchiveResults() {
     }
     const status = String(summary.status || "").trim().toLowerCase();
     if (status === "live-session-recovery") {
-      setArchiveActionStatus("Сессия BSportsFan переподключается. Повторите через минуту.");
+      setArchiveActionStatus("Источник данных переключается. Досбор продолжится автоматически.");
       return;
     }
     if (status === "another-tab-backfill") {
@@ -526,15 +537,15 @@ async function backfillArchiveResults() {
       return;
     }
     if (status === "not-bsportsfan") {
-      setArchiveActionStatus("Откройте вкладку BSportsFan и повторите досбор.");
+      setArchiveActionStatus("Откройте вкладку настольного тенниса и повторите досбор.");
       return;
     }
     if (status === "bsportsfan-protection") {
-      setArchiveActionStatus("BSportsFan включил проверку безопасности. Завершите её во вкладке сайта и повторите досбор.");
+      setArchiveActionStatus("Основной источник недоступен — включается резервный. Досбор продолжится автоматически.");
       return;
     }
     if (status === "bsportsfan-protection-opened") {
-      setArchiveActionStatus("Открыта страница результатов BSportsFan. Завершите проверку — после загрузки итоги дособерутся автоматически.");
+      setArchiveActionStatus("Открыт резервный источник результатов. Итоги дособерутся автоматически.");
       return;
     }
     if (status === "runtime-unavailable") {
@@ -555,9 +566,9 @@ async function backfillArchiveResults() {
     const stopMessage = stopped === "forecast-priority"
       ? " Новые матчи получили приоритет — остальные итоги дособерутся следующим запуском."
       : stopped === "bsportsfan-protection"
-        ? " BSportsFan включил проверку безопасности — завершите её во вкладке сайта."
+        ? " Источник переключается — досбор продолжится автоматически."
       : stopped
-        ? " Досбор остановлен из-за недоступности BSportsFan."
+        ? " Досбор временно приостановлен и будет повторён автоматически."
         : "";
     const message = `Итоги: добавлено ${updated}, уже были ${alreadyUpdated}, проверено ${checked}, ждут завершения ${notReady}, не распознано ${unresolved}, ошибок ${failed}.${stopMessage}`;
     const recoveryTotal = Math.max(0, Number(summary.recovery && summary.recovery.total || 0));
@@ -807,9 +818,37 @@ function setArchiveActionStatus(message) {
 }
 
 async function sendTelegramTabAction(detail) {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  const collectorResponse = await sendRuntimeMessage({
+    type: "lvr:getTableTennisCollector"
+  }).catch(() => null);
+  const collectorTabId = Number(
+    collectorResponse && collectorResponse.collector && collectorResponse.collector.tabId
+  );
+  let tab = Number.isInteger(collectorTabId) && collectorTabId > 0
+    ? await chrome.tabs.get(collectorTabId).catch(() => null)
+    : null;
   if (!tab || !tab.id || !isBsportsfanUrl(tab.url)) {
-    throw new Error("Открой активную вкладку bsportsfan для этой операции.");
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    tab = activeTab && isBsportsfanUrl(activeTab.url) ? activeTab : null;
+  }
+  if (!tab || !tab.id || !isBsportsfanUrl(tab.url)) {
+    const tabs = await chrome.tabs.query({
+      url: [
+        "https://bsportsfan.com/*",
+        "https://*.bsportsfan.com/*",
+        "https://betsapi.com/*",
+        "https://*.betsapi.com/*"
+      ]
+    }).catch(() => []);
+    tab = (Array.isArray(tabs) ? tabs : [])
+      .filter((candidate) => candidate && candidate.id && isBsportsfanUrl(candidate.url))
+      .sort((left, right) => (
+        Number(!/\/cip\/table-tennis\/?(?:[?#]|$)/i.test(String(left.url || "")))
+        - Number(!/\/cip\/table-tennis\/?(?:[?#]|$)/i.test(String(right.url || "")))
+      ))[0] || null;
+  }
+  if (!tab || !tab.id) {
+    throw new Error("Нет рабочей вкладки источника данных.");
   }
   try {
     const response = await sendTabMessage(tab.id, { type: "lvr:telegramAction", detail });
@@ -1727,7 +1766,7 @@ function sendTabMessage(tabId, message) {
         return;
       }
       settled = true;
-      reject(new Error("Операция во вкладке BSportsFan превысила 120 секунд и была освобождена."));
+      reject(new Error("Операция источника данных превысила 120 секунд и была освобождена."));
     }, 120 * 1000);
     chrome.tabs.sendMessage(tabId, message, (response) => {
       const runtimeError = chrome.runtime.lastError;
