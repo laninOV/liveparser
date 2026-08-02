@@ -51,7 +51,9 @@
   const MATCH_START_PAIR_PROTOCOL = globalThis.LvrVerifiedPairRegimeV1
     && globalThis.LvrVerifiedPairRegimeV1.PROTOCOL || {};
   const MATCH_START_PAIR_GATE_ID = String(MATCH_START_PAIR_PROTOCOL.gateId || "");
-  const PLAYER_MATCHES_CACHE_TTL_MS = 2 * 60 * 1000;
+  const PLAYER_MATCHES_CACHE_TTL_MS = 20 * 60 * 1000;
+  const PLAYER_MATCHES_CACHE_STORAGE_KEY = "__lvrPlayerMatchesCacheV1";
+  const PLAYER_MATCHES_CACHE_STORAGE_VERSION = 1;
   const FRESH_FORM3_WEIGHTS = [0.5, 0.3, 0.2];
   const ARCHIVE_MAX_CANDIDATE_URLS = 60;
   const RESULTS_PATH = "/ce/table-tennis/";
@@ -60,15 +62,16 @@
   const TELEGRAM_RESULT_PAGE_AUTO_BACKFILL_DELAY_MS = 5 * 1000;
   const TELEGRAM_RESULT_AUTO_BACKFILL_INTERVAL_MS = 10 * 60 * 1000;
   const TELEGRAM_RESULT_AUTO_BACKFILL_MIN_ROW_AGE_MS = 5 * 60 * 1000;
-  const TELEGRAM_RESULT_AUTO_BACKFILL_LIMIT = 4;
+  const TELEGRAM_RESULT_AUTO_BACKFILL_LIMIT = 2;
   const TELEGRAM_RESULT_AUTO_BACKFILL_RETRY_MS = 15 * 60 * 1000;
   const TELEGRAM_RESULT_AUTO_BACKFILL_ERROR_RETRY_MS = 15 * 60 * 1000;
   const TELEGRAM_POINT_SNAPSHOT_MIN_SIDE_POINTS = 8;
   const TELEGRAM_POINT_SNAPSHOT_MIN_TOTAL_POINTS = 16;
   const PAGE_BRIDGE_SCRIPT_VERSION = "bsf-prematch-runtime-v6";
   const MAX_ARCHIVE_FETCH_CONCURRENCY = 5;
-  const INLINE_FORECAST_LOADING_STALE_MS = 2 * 60 * 1000;
+  const INLINE_FORECAST_LOADING_STALE_MS = 3 * 60 * 1000;
   const INLINE_FORECAST_COLLECTION_TIMEOUT_MS = 45 * 1000;
+  const INLINE_FORECAST_PREWARM_COLLECTION_TIMEOUT_MS = 2 * 60 * 1000;
   const INLINE_FORECAST_ERROR_RETRY_MS = 60 * 1000;
   const INLINE_FORECAST_TRANSIENT_RETRY_MS = 12 * 1000;
   const INLINE_FORECAST_MAX_TRANSIENT_ATTEMPTS = 3;
@@ -76,7 +79,8 @@
   const RUNTIME_SETTINGS_TIMEOUT_MS = 6000;
   const RUNTIME_DELIVERY_TIMEOUT_MS = 22 * 1000;
   const BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS = 15 * 1000;
-  const BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS = 10 * 60 * 1000;
+  const BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS = 30 * 60 * 1000;
+  const BSPORTSFAN_VISIBLE_CHALLENGE_RETRY_MS = 30 * 60 * 1000;
   const BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS = 6 * 60 * 60 * 1000;
   const LIVE_SESSION_RECOVERY_STORAGE_KEY = "__lvrBsportsfanLiveSessionRecoveryV2";
   const LEGACY_LIVE_SESSION_RECOVERY_STORAGE_KEY = "__lvrBsportsfanLiveSessionRecoveryV1";
@@ -138,6 +142,9 @@
   let telegramResultAutoBackfillLastSummary = null;
   let telegramOpeningOddsBackfillRunning = false;
   let telegramOpeningOddsBackfillLastSummary = null;
+  let playerMatchesCacheLoaded = false;
+  let playerMatchesCachePersistTimer = 0;
+  let visibleChallengeRetryTimer = 0;
   let prematchPointCacheLoaded = false;
   let prematchPointCachePersistTimer = 0;
   let prematchPointFetchActive = 0;
@@ -148,7 +155,6 @@
   let liveSessionRecoveryObserver = null;
   let liveSessionRecoveryPreparation = null;
   let visibleChallengeActive = false;
-  let visibleChallengeLastReportedAt = 0;
   let visibleHealthyReported = false;
   const telegramResultAutoBackfillRetryAt = new Map();
 
@@ -884,7 +890,10 @@
     if (!challenged) {
       if (visibleChallengeActive || !visibleHealthyReported) {
         visibleChallengeActive = false;
-        visibleChallengeLastReportedAt = 0;
+        if (visibleChallengeRetryTimer) {
+          window.clearTimeout(visibleChallengeRetryTimer);
+          visibleChallengeRetryTimer = 0;
+        }
         visibleHealthyReported = true;
         bsportsfanNavigationProtectionOpenUntil = 0;
         bsportsfanNavigationProtectionReason = "";
@@ -901,6 +910,11 @@
     const firstObservation = !visibleChallengeActive;
     visibleChallengeActive = true;
     visibleHealthyReported = false;
+    bsportsfanNavigationProtectionOpenUntil = Math.max(
+      bsportsfanNavigationProtectionOpenUntil,
+      now + BSPORTSFAN_VISIBLE_CHALLENGE_RETRY_MS
+    );
+    bsportsfanNavigationProtectionReason = "visible-bsportsfan-security-challenge";
     inlineAutoForecastQueue.clear();
     for (const job of inlineAutoForecastActiveJobs.values()) {
       if (!job) continue;
@@ -909,14 +923,13 @@
       job.preemptRequestedAt = now;
     }
 
-    if (now - visibleChallengeLastReportedAt >= 5 * 60 * 1000) {
-      visibleChallengeLastReportedAt = now;
+    if (firstObservation) {
       sendRuntimeMessage({
         type: "lvr:reportBsportsfanProtection",
         reason: "visible-bsportsfan-security-challenge",
         code: "bsportsfan-challenge",
-        manualRequired: true,
-        retryAfterMs: BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS,
+        manualRequired: false,
+        retryAfterMs: BSPORTSFAN_VISIBLE_CHALLENGE_RETRY_MS,
         observedAt: now,
         url: normalizeUrl(location.href)
       }).catch(() => {});
@@ -926,13 +939,22 @@
           source: "bsportsfan-protection",
           message: "BSportsFan просит пройти проверку",
           candidates: 0,
-          sample: ["Откройте вкладку BSportsFan и завершите проверку безопасности"],
+          sample: ["Запросы остановлены; расширение повторит подключение через 30 минут"],
           bsportsfan: {
             challenge: true,
-            observedAt: now
+            observedAt: now,
+            autoRetryAt: now + BSPORTSFAN_VISIBLE_CHALLENGE_RETRY_MS
           }
         }
       }).catch(() => {});
+    }
+    if (!visibleChallengeRetryTimer) {
+      visibleChallengeRetryTimer = window.setTimeout(() => {
+        visibleChallengeRetryTimer = 0;
+        if (isBsportsfanDocumentChallenge(document)) {
+          window.location.reload();
+        }
+      }, BSPORTSFAN_VISIBLE_CHALLENGE_RETRY_MS);
     }
     if (firstObservation) {
       notifyBsportsfanAttention("security-challenge");
@@ -3775,8 +3797,7 @@
     const doc = parseHtmlDocument(html);
     if (isBsportsfanDocumentChallenge(doc)) {
       throw createBsportsfanChallengeError(
-        "BsportsFan results page returned a security challenge",
-        { report: false }
+        "BsportsFan results page returned a security challenge"
       );
     }
     if (isBsportsfanDocumentLiveSessionExpired(doc)) {
@@ -3846,8 +3867,7 @@
           }
           if (isBsportsfanDocumentChallenge(doc)) {
             finish(createBsportsfanChallengeError(
-              "BsportsFan results iframe returned a security challenge",
-              { report: false }
+              "BsportsFan results iframe returned a security challenge"
             ));
             return;
           }
@@ -4208,7 +4228,7 @@
           return frameResult;
         }
       } catch (error) {
-        if (isBsportsfanProtectionError(error) && !isBsportsfanChallengeError(error)) {
+        if (isBsportsfanProtectionError(error)) {
           throw error;
         }
       }
@@ -4231,8 +4251,7 @@
     const snapshot = buildBsportsfanSnapshotFromDocument(doc, matchUrl, "telegram-result-backfill");
     if (isBsportsfanChallengeSnapshot(snapshot) || isBsportsfanDocumentChallenge(doc)) {
       throw createBsportsfanChallengeError(
-        "BsportsFan result page returned a security challenge",
-        { report: false }
+        "BsportsFan result page returned a security challenge"
       );
     }
     if (isBsportsfanDocumentLiveSessionExpired(doc)) {
@@ -4323,8 +4342,7 @@
           }
           if (isBsportsfanDocumentChallenge(doc)) {
             finish(createBsportsfanChallengeError(
-              "BsportsFan result iframe returned a security challenge",
-              { report: false }
+              "BsportsFan result iframe returned a security challenge"
             ));
             return;
           }
@@ -4911,6 +4929,7 @@
       return true;
     }
     addBoundedSetValue(telegramResultUpdateState, key, RUNTIME_STATE_MAX_ENTRIES);
+    invalidatePlayerMatchesCache(playerLinks);
     sendRuntimeMessage({
       type: "lvr:updateTelegramPredictionResult",
       result: {
@@ -5053,6 +5072,7 @@
       return;
     }
     addBoundedSetValue(telegramResultUpdateState, key, RUNTIME_STATE_MAX_ENTRIES);
+    invalidatePlayerMatchesCache(resultPlayerLinks);
     sendRuntimeMessage({
       type: "lvr:updateTelegramPredictionResult",
       result: {
@@ -5883,7 +5903,10 @@
       updatedAt: Date.now()
     });
     const collectionStartedAt = Date.now();
-    const collectionDeadlineAt = collectionStartedAt + INLINE_FORECAST_COLLECTION_TIMEOUT_MS;
+    const collectionTimeoutMs = options.startAuto
+      ? INLINE_FORECAST_COLLECTION_TIMEOUT_MS
+      : INLINE_FORECAST_PREWARM_COLLECTION_TIMEOUT_MS;
+    const collectionDeadlineAt = collectionStartedAt + collectionTimeoutMs;
     const requestPriority = getInlineForecastRequestPriority(options);
     try {
       const collection = (async () => {
@@ -6403,13 +6426,14 @@
         break;
       }
       const jobId = ++inlineAutoForecastJobId;
+      const workerLeaseMs = getInlineForecastWorkerLeaseMs(entry[1]);
       const job = {
         id: jobId,
         matchUrl: entry[0],
         options: entry[1] || {},
         preemptRequested: false,
         startedAt: Date.now(),
-        deadlineAt: Date.now() + INLINE_FORECAST_WORKER_LEASE_MS
+        deadlineAt: Date.now() + workerLeaseMs
       };
       inlineAutoForecastActiveJobs.set(jobId, job);
       inlineAutoForecastActiveWorkers = inlineAutoForecastActiveJobs.size;
@@ -6471,7 +6495,7 @@
     const forecastLease = await sendRuntimeMessage({
       type: "lvr:acquireBsportsfanForecastLease",
       matchUrl,
-      leaseMs: INLINE_FORECAST_WORKER_LEASE_MS
+      leaseMs: getInlineForecastWorkerLeaseMs(options)
     }).catch(() => ({ granted: true, token: "" }));
     if (!forecastLease || forecastLease.granted !== true) {
       return;
@@ -6498,6 +6522,13 @@
     if (state && state.status === "ready") {
       addBoundedSetValue(inlineAutoForecastDone, matchUrl, RUNTIME_STATE_MAX_ENTRIES);
     }
+  }
+
+  function getInlineForecastWorkerLeaseMs(options = {}) {
+    const collectionTimeoutMs = options && options.startAuto
+      ? INLINE_FORECAST_COLLECTION_TIMEOUT_MS
+      : INLINE_FORECAST_PREWARM_COLLECTION_TIMEOUT_MS;
+    return collectionTimeoutMs + 5000;
   }
 
   function reconcileInlineForecastScheduler(now = Date.now()) {
@@ -8996,7 +9027,7 @@
       }
       frameError = describeMissingGraph(frameSnapshot, null);
     } catch (error) {
-      if (isBsportsfanProtectionError(error) && !isBsportsfanChallengeError(error)) {
+      if (isBsportsfanProtectionError(error)) {
         throw error;
       }
       frameError = stringifyError(error);
@@ -9050,7 +9081,7 @@
       }
       frameError = describeMissingPlayers(frameSnapshot);
     } catch (error) {
-      if (isBsportsfanProtectionError(error) && !isBsportsfanChallengeError(error)) {
+      if (isBsportsfanProtectionError(error)) {
         throw error;
       }
       frameError = stringifyError(error);
@@ -9141,7 +9172,7 @@
           };
         }
       } catch (error) {
-        if (isBsportsfanProtectionError(error) && !isBsportsfanChallengeError(error)) {
+        if (isBsportsfanProtectionError(error)) {
           throw error;
         }
         frameMarket = {
@@ -9272,8 +9303,7 @@
           wakePageInFrame(doc, win);
           if (isBsportsfanDocumentChallenge(doc)) {
             finish(createBsportsfanChallengeError(
-              "BsportsFan odds iframe returned a security challenge",
-              { report: false }
+              "BsportsFan odds iframe returned a security challenge"
             ));
             return;
           }
@@ -9366,6 +9396,7 @@
   }
 
   async function fetchPlayerResultMatches(url, options = {}) {
+    ensurePlayerMatchesCacheLoaded();
     const cacheKey = normalizeUrl(url);
     const cached = playerMatchesCache.get(cacheKey);
     if (
@@ -9396,15 +9427,18 @@
       deadlineAt
     })
       .then((matches) => {
+        const safeMatches = (Array.isArray(matches) ? matches : [])
+          .slice(0, PROFILE_SCORE_HISTORY_MATCHES * 2);
         if (playerMatchesCache.get(cacheKey) === inFlight) {
           setBoundedMapValue(
             playerMatchesCache,
             cacheKey,
-            { ts: Date.now(), matches },
+            { ts: Date.now(), matches: safeMatches },
             NETWORK_CACHE_MAX_ENTRIES
           );
+          schedulePlayerMatchesCachePersist();
         }
-        return matches;
+        return safeMatches;
       })
       .catch((error) => {
         if (playerMatchesCache.get(cacheKey) === inFlight) {
@@ -9417,6 +9451,74 @@
     return promise;
   }
 
+  function ensurePlayerMatchesCacheLoaded() {
+    if (playerMatchesCacheLoaded) {
+      return;
+    }
+    playerMatchesCacheLoaded = true;
+    try {
+      const raw = window.localStorage
+        && window.localStorage.getItem(PLAYER_MATCHES_CACHE_STORAGE_KEY);
+      const stored = raw ? JSON.parse(raw) : null;
+      if (Number(stored && stored.version || 0) !== PLAYER_MATCHES_CACHE_STORAGE_VERSION) {
+        return;
+      }
+      const now = Date.now();
+      for (const [key, entry] of Array.isArray(stored && stored.entries) ? stored.entries : []) {
+        if (
+          entry
+          && Array.isArray(entry.matches)
+          && now - Number(entry.ts || 0) <= PLAYER_MATCHES_CACHE_TTL_MS
+        ) {
+          setBoundedMapValue(playerMatchesCache, key, entry, NETWORK_CACHE_MAX_ENTRIES);
+        }
+      }
+    } catch (_) {
+      // A cache failure may cost requests, but must never block forecasting.
+    }
+  }
+
+  function schedulePlayerMatchesCachePersist() {
+    if (playerMatchesCachePersistTimer) {
+      return;
+    }
+    playerMatchesCachePersistTimer = window.setTimeout(() => {
+      playerMatchesCachePersistTimer = 0;
+      try {
+        const entries = Array.from(playerMatchesCache.entries())
+          .filter(([, entry]) => entry && Array.isArray(entry.matches))
+          .slice(-NETWORK_CACHE_MAX_ENTRIES);
+        if (window.localStorage) {
+          window.localStorage.setItem(PLAYER_MATCHES_CACHE_STORAGE_KEY, JSON.stringify({
+            version: PLAYER_MATCHES_CACHE_STORAGE_VERSION,
+            entries
+          }));
+        }
+      } catch (_) {
+        // Persistence is an optimization; live collection remains available.
+      }
+    }, 1000);
+  }
+
+  function invalidatePlayerMatchesCache(playerLinks) {
+    ensurePlayerMatchesCacheLoaded();
+    const links = (Array.isArray(playerLinks) ? playerLinks : [])
+      .map((link) => normalizeUrl(link && link.url || ""))
+      .filter(Boolean);
+    const playerIds = new Set(links.map(getBsportsfanPlayerId).filter(Boolean));
+    let changed = false;
+    for (const key of Array.from(playerMatchesCache.keys())) {
+      if (links.includes(key) || playerIds.has(getBsportsfanPlayerId(key))) {
+        playerMatchesCache.delete(key);
+        changed = true;
+      }
+    }
+    if (changed) {
+      schedulePlayerMatchesCachePersist();
+    }
+    return changed;
+  }
+
   async function fetchPlayerResultMatchesUncached(url, options = {}) {
     let frameError = "";
     if (options.allowIframe !== false) {
@@ -9427,7 +9529,7 @@
         }
         frameError = "results 0";
       } catch (error) {
-        if (isBsportsfanProtectionError(error) && !isBsportsfanChallengeError(error)) {
+        if (isBsportsfanProtectionError(error)) {
           throw error;
         }
         frameError = stringifyError(error);
@@ -9533,8 +9635,7 @@
           wakePageInFrame(doc, win);
           if (isBsportsfanDocumentChallenge(doc)) {
             finish(createBsportsfanChallengeError(
-              "BsportsFan player iframe returned a security challenge",
-              { report: false }
+              "BsportsFan player iframe returned a security challenge"
             ));
             return;
           }
@@ -9630,8 +9731,7 @@
           const snapshot = buildBsportsfanSnapshotFromDocument(doc, url, "archive-frame");
           if (isBsportsfanChallengeSnapshot(snapshot) || isBsportsfanDocumentChallenge(doc)) {
             finish(createBsportsfanChallengeError(
-              "BsportsFan match iframe returned a security challenge",
-              { report: false }
+              "BsportsFan match iframe returned a security challenge"
             ));
             return;
           }
@@ -9729,8 +9829,7 @@
           const snapshot = buildBsportsfanSeedSnapshotFromDocument(doc, url, "page-frame");
           if (isBsportsfanChallengeSnapshot(snapshot) || isBsportsfanDocumentChallenge(doc)) {
             finish(createBsportsfanChallengeError(
-              "BsportsFan match page iframe returned a security challenge",
-              { report: false }
+              "BsportsFan match page iframe returned a security challenge"
             ));
             return;
           }
@@ -9998,19 +10097,17 @@
     return error;
   }
 
-  function createBsportsfanChallengeError(message, options = {}) {
+  function createBsportsfanChallengeError(message) {
     const error = new Error(String(message || "BsportsFan returned a security challenge"));
     error.code = "bsportsfan-challenge";
     error.retryAfterMs = BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS;
     error.retryBudgetExempt = true;
-    if (!options || options.report !== false) {
-      bsportsfanNavigationProtectionOpenUntil = Math.max(
-        bsportsfanNavigationProtectionOpenUntil,
-        Date.now() + BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS
-      );
-      bsportsfanNavigationProtectionReason = error.message;
-      reportBsportsfanProtection(error);
-    }
+    bsportsfanNavigationProtectionOpenUntil = Math.max(
+      bsportsfanNavigationProtectionOpenUntil,
+      Date.now() + BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS
+    );
+    bsportsfanNavigationProtectionReason = error.message;
+    reportBsportsfanProtection(error);
     return error;
   }
 

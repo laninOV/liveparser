@@ -78,9 +78,9 @@ const TELEGRAM_MATCH_START_DELIVERY_MAX_AGE_MS = 20000;
 const BSPORTSFAN_PROXY_FETCH_TIMEOUT_MS = 12 * 1000;
 const BSPORTSFAN_PROXY_FETCH_MAX_CHARS = 5 * 1024 * 1024;
 const BSPORTSFAN_PROXY_FETCH_CONCURRENCY = 1;
-const BSPORTSFAN_PROXY_FETCH_MIN_INTERVAL_MS = 2500;
+const BSPORTSFAN_PROXY_FETCH_MIN_INTERVAL_MS = 5000;
 const BSPORTSFAN_PROXY_FETCH_QUEUE_MAX = 64;
-const BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS = 10 * 60 * 1000;
+const BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS = 30 * 60 * 1000;
 const BSPORTSFAN_PROXY_REQUEST_RETRY_MS = 60 * 1000;
 const BSPORTSFAN_PROXY_CACHE_DEFAULT_TTL_MS = 30 * 1000;
 const BSPORTSFAN_PROXY_CACHE_MAX_TTL_MS = 10 * 60 * 1000;
@@ -100,7 +100,7 @@ const BSPORTSFAN_MAINTENANCE_LEASE_STORAGE_KEY = "bsportsfanMaintenanceLease";
 const BSPORTSFAN_RESULT_RECOVERY_STORAGE_KEY = "bsportsfanResultRecoveryState";
 const BSPORTSFAN_RESULT_BACKFILL_LEASE_MAX_MS = 12 * 60 * 1000;
 const BSPORTSFAN_NAVIGATION_LEASE_MAX_MS = 12 * 1000;
-const BSPORTSFAN_FORECAST_LEASE_MAX_MS = 60 * 1000;
+const BSPORTSFAN_FORECAST_LEASE_MAX_MS = 130 * 1000;
 const BSPORTSFAN_TAB_RELOAD_INTERVAL_MS = 2500;
 const BSPORTSFAN_RESULT_RECOVERY_NAVIGATION_DELAY_MS = 12 * 1000;
 const BSPORTSFAN_RESULT_RECOVERY_MIN_AGE_MS = 20 * 60 * 1000;
@@ -223,12 +223,24 @@ async function runBsportsfanHealthWatchdog(now = Date.now()) {
   const source = normalizeTelegramText(scanStatus && scanStatus.source || "").toLowerCase();
   const recovery = scanStatus && scanStatus.bsportsfan
     && scanStatus.bsportsfan.sessionRecovery;
-  if (
+  const challengeActive = Boolean(
     source === "bsportsfan-protection"
     || scanStatus && scanStatus.bsportsfan && scanStatus.bsportsfan.challenge === true
-    || recovery && recovery.active === true
+  );
+  const challengeRetryAt = Number(
+    scanStatus && scanStatus.bsportsfan && scanStatus.bsportsfan.autoRetryAt || 0
+  );
+  if (
+    recovery && recovery.active === true
   ) {
     return { reloaded: false, reason: "manual-or-recovery-active" };
+  }
+  if (challengeActive && challengeRetryAt > now) {
+    return {
+      reloaded: false,
+      reason: "challenge-retry-wait",
+      retryAfterMs: challengeRetryAt - now
+    };
   }
   const heartbeatAt = Number(scanStatus && scanStatus.ts || 0);
   const heartbeatStale = !(heartbeatAt > 0) || now - heartbeatAt >= BSPORTSFAN_HEALTH_STALE_MS;
@@ -898,10 +910,10 @@ function normalizeBsportsfanRequestPriority(value) {
 function getBsportsfanRequestIntervalMs(priority) {
   const normalized = normalizeBsportsfanRequestPriority(priority);
   if (normalized <= 0) return BSPORTSFAN_PROXY_FETCH_MIN_INTERVAL_MS;
-  if (normalized === 1) return 3000;
-  if (normalized === 2) return 4000;
-  if (normalized === 3) return 6000;
-  return 8000;
+  if (normalized === 1) return 7500;
+  if (normalized === 2) return 10000;
+  if (normalized === 3) return 15000;
+  return 20000;
 }
 
 function compareBsportsfanProxyFetchJobs(left, right) {
@@ -6365,12 +6377,19 @@ function buildTelegramCollectorHealth(scanStatus, now = Date.now()) {
   if (
     recovery.manual === true
     || normalizeTelegramText(recovery.stage || "").toLowerCase() === "manual-required"
-    || source === "bsportsfan-protection"
-    || bsportsfan.challenge === true
   ) {
     return {
       state: "manual",
       text: "🔴 Сбор: откройте BSportsFan и пройдите проверку"
+    };
+  }
+  if (source === "bsportsfan-protection" || bsportsfan.challenge === true) {
+    const retryAt = Number(bsportsfan.autoRetryAt || bsportsfanProtectionOpenUntil || 0);
+    return {
+      state: "challenge",
+      text: retryAt > now
+        ? `⏸ Сбор: проверка сайта · автоповтор в ${formatTelegramStatsTime(retryAt)}`
+        : "🔄 Сбор: повторно подключается к BSportsFan"
     };
   }
   if (bsportsfanProtectionOpenUntil > now) {
