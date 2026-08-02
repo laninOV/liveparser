@@ -35,6 +35,7 @@
     ? globalThis.crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const TABLE_TENNIS_COLLECTOR_RETRY_INTERVAL_MS = 10 * 1000;
+  const TABLE_TENNIS_HEALTH_REPORT_INTERVAL_MS = 30 * 1000;
   const MUTATION_DELAY_MS = 250;
   const MUTATION_MIN_UPDATE_INTERVAL_MS = 3000;
   const ARCHIVE_MATCHES_PER_PLAYER = 5;
@@ -173,8 +174,11 @@
   let liveSessionRecoveryPreparation = null;
   let visibleChallengeActive = false;
   let visibleHealthyReported = false;
+  let lastVisibleHealthyReportAt = 0;
   let tableTennisCollectorLeadershipActive = true;
   let tableTennisCollectorHeartbeatStarted = false;
+  let tableTennisSourceRecoveryProbeStarted = false;
+  let tableTennisSourceFailoverRetryNeeded = false;
   const telegramResultAutoBackfillRetryAt = new Map();
 
   let mutationTimer = 0;
@@ -188,12 +192,13 @@
     installProductionBridge();
     installRuntimeListener();
     await hydrateSharedTableTennisParserCaches();
-    const sourceReady = await prepareTableTennisDataSourceBeforeCollection();
-    if (!sourceReady) {
-      return;
-    }
     const collectorLeader = await ensureTableTennisCollectorLeadership();
     if (!collectorLeader) {
+      return;
+    }
+    const sourceReady = await prepareTableTennisDataSourceBeforeCollection();
+    if (!sourceReady) {
+      installTableTennisSourceRecoveryProbe();
       return;
     }
     installLiveSessionRecovery();
@@ -209,7 +214,16 @@
       return true;
     }
     if (!isCurrentTableTennisSourcePageHealthy(document)) {
-      await sleep(1500);
+      const explicitFailure = isBsportsfanDocumentChallenge(document)
+        || isBsportsfanDocumentLiveSessionExpired(document);
+      if (!explicitFailure) {
+        for (const delayMs of [1500, 2500, 4000]) {
+          await sleep(delayMs);
+          if (isCurrentTableTennisSourcePageHealthy(document)) {
+            break;
+          }
+        }
+      }
       if (!isCurrentTableTennisSourcePageHealthy(document)) {
         const error = new Error("Источник не отдал распознаваемую страницу настольного тенниса");
         error.code = "table-tennis-source-invalid-page";
@@ -224,11 +238,56 @@
       url: normalizeUrl(location.href)
     }).catch(() => null);
     visibleHealthyReported = Boolean(response && response.healthy);
+    if (visibleHealthyReported) {
+      lastVisibleHealthyReportAt = Date.now();
+    }
     if (response && response.shouldSwitch === true && response.targetOrigin) {
       navigateToTableTennisSource(response.targetOrigin, "startup-source-route");
       return false;
     }
     return true;
+  }
+
+  function installTableTennisSourceRecoveryProbe() {
+    if (
+      tableTennisSourceRecoveryProbeStarted
+      || !isCipTableTennisMonitorPage()
+      || !tableTennisCollectorLeadershipActive
+    ) {
+      return;
+    }
+    tableTennisSourceRecoveryProbeStarted = true;
+    let recoveryStarted = false;
+    const check = () => {
+      if (recoveryStarted || !tableTennisCollectorLeadershipActive) {
+        return;
+      }
+      if (isCurrentTableTennisSourcePageHealthy(document)) {
+        recoveryStarted = true;
+        sendRuntimeMessage({
+          type: "lvr:reportBsportsfanHealthy",
+          observedAt: Date.now(),
+          url: normalizeUrl(location.href)
+        }).finally(() => window.location.reload());
+        return;
+      }
+      if (tableTennisSourceFailoverRetryNeeded && !tableTennisSourceFailoverStarted) {
+        tableTennisSourceFailoverRetryNeeded = false;
+        scheduleTableTennisSourceFailover("source-failover-retry");
+      }
+    };
+    window.setInterval(check, 5000);
+    if (document.body && typeof MutationObserver !== "undefined") {
+      const observer = new MutationObserver(check);
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ["class", "style", "aria-hidden"]
+      });
+    }
+    check();
   }
 
   async function ensureTableTennisCollectorLeadership() {
@@ -559,6 +618,7 @@
         type: "lvr:reportBsportsfanProtection",
         reason: "live-session-manual-recovery-required",
         code: "bsportsfan-session-expired",
+        visibleFailure: true,
         manualRequired: true,
         retryAfterMs: BSPORTSFAN_MANUAL_PROTECTION_PAUSE_MS,
         observedAt: recovery.detectedAt,
@@ -1184,7 +1244,17 @@
   function pauseForVisibleBsportsfanChallenge() {
     const challenged = isBsportsfanDocumentChallenge(document);
     if (!challenged) {
-      if (visibleChallengeActive || !visibleHealthyReported) {
+      const now = Date.now();
+      const canReportHealth = isCipTableTennisMonitorPage()
+        && tableTennisCollectorLeadershipActive;
+      if (
+        canReportHealth
+        && (
+          visibleChallengeActive
+          || !visibleHealthyReported
+          || now - lastVisibleHealthyReportAt >= TABLE_TENNIS_HEALTH_REPORT_INTERVAL_MS
+        )
+      ) {
         if (!isCurrentTableTennisSourcePageHealthy(document)) {
           return false;
         }
@@ -1194,6 +1264,7 @@
           visibleChallengeRetryTimer = 0;
         }
         visibleHealthyReported = true;
+        lastVisibleHealthyReportAt = now;
         clearTableTennisNavigationProtection(getCurrentTableTennisSourceId());
         sendRuntimeMessage({
           type: "lvr:reportBsportsfanHealthy",
@@ -1208,6 +1279,7 @@
     const firstObservation = !visibleChallengeActive;
     visibleChallengeActive = true;
     visibleHealthyReported = false;
+    lastVisibleHealthyReportAt = 0;
     openTableTennisNavigationProtection(
       getCurrentTableTennisSourceId(),
       "visible-table-tennis-security-challenge",
@@ -1245,8 +1317,8 @@
         }
       }, BSPORTSFAN_VISIBLE_CHALLENGE_RETRY_MS);
     }
-    if (firstObservation && !scheduleTableTennisSourceFailover("visible-security-challenge")) {
-      notifyBsportsfanAttention("security-challenge");
+    if (firstObservation) {
+      scheduleTableTennisSourceFailover("visible-security-challenge");
     }
     return true;
   }
@@ -6387,15 +6459,6 @@
       if (!isInlineForecastRunCurrent(matchUrl, runId)) {
         return;
       }
-      if (
-        isBsportsfanProtectionError(error)
-        && !isTableTennisEndpointBlockedError(error)
-      ) {
-        scheduleTableTennisSourceFailover(
-          normalizeText(error && error.code || "bsportsfan-protection"),
-          error
-        );
-      }
       const archive = buildInlineForecastFailureArchive(matchUrl, options.seedSnapshot, error, collectionStartedAt);
       const retryable = isRetryableInlineForecastError(error);
       const retryBudgetExempt = isInlineForecastRetryBudgetExempt(error);
@@ -10677,22 +10740,6 @@
         throw new Error("BsportsFan proxy returned no text");
       }
       return response.text;
-    }).catch((error) => {
-      if (
-        isBsportsfanLiveSessionExpiredError(error)
-        && !isTableTennisEndpointBlockedError(error)
-      ) {
-        beginLiveSessionRecovery(null, "fetch-live-session-expired", error);
-      } else if (
-        isBsportsfanProtectionError(error)
-        && !isTableTennisEndpointBlockedError(error)
-      ) {
-        scheduleTableTennisSourceFailover(
-          normalizeText(error && error.code || "bsportsfan-protection"),
-          error
-        );
-      }
-      throw error;
     }).finally(() => {
       if (fetchTextCache.get(cacheKey) === entry) {
         fetchTextCache.delete(cacheKey);
@@ -11789,13 +11836,21 @@
   function scheduleTableTennisSourceFailover(reason = "source-protection", error = null) {
     if (
       tableTennisSourceFailoverStarted
-      || !isBsportsfanTableTennisPage()
+      || !isCipTableTennisMonitorPage()
+      || !tableTennisCollectorLeadershipActive
     ) {
       return false;
     }
-    tableTennisSourceFailoverStarted = true;
     const currentSourceId = getCurrentTableTennisSourceId();
     const failedSourceId = normalizeText(error && error.sourceId || "") || currentSourceId;
+    if (
+      failedSourceId !== currentSourceId
+      && isCurrentTableTennisSourcePageHealthy(document)
+    ) {
+      return false;
+    }
+    tableTennisSourceFailoverRetryNeeded = false;
+    tableTennisSourceFailoverStarted = true;
     const rateLimited = Number(error && error.status || 0) === 429
       || normalizeText(error && error.code || "") === "bsportsfan-rate-limited";
     sendRuntimeMessage({
@@ -11804,6 +11859,7 @@
       code: normalizeText(error && error.code || "bsportsfan-challenge"),
       status: Number(error && error.status || 0) || 0,
       sourceId: normalizeText(error && error.sourceId || ""),
+      visibleFailure: true,
       manualRequired: false,
       retryAfterMs: Math.max(
         rateLimited ? 60 * 1000 : BSPORTSFAN_NAVIGATION_PROTECTION_COOLDOWN_MS,
@@ -11812,6 +11868,12 @@
       observedAt: Date.now(),
       url: normalizeUrl(location.href)
     }).then((route) => {
+      if (route && route.reported === false) {
+        tableTennisSourceFailoverStarted = false;
+        tableTennisSourceFailoverRetryNeeded = true;
+        visibleChallengeActive = false;
+        return;
+      }
       if (route && route.targetOrigin && route.targetOrigin !== location.origin) {
         stopTableTennisCollectorWork("data-source-failover");
         if (!navigateToTableTennisSource(route.targetOrigin, reason)) {
@@ -11821,6 +11883,17 @@
       }
       tableTennisSourceFailoverStarted = false;
       if (route && route.targetOrigin === location.origin) {
+        return;
+      }
+      if (isCurrentTableTennisSourcePageHealthy(document)) {
+        visibleChallengeActive = false;
+        visibleHealthyReported = true;
+        lastVisibleHealthyReportAt = Date.now();
+        sendRuntimeMessage({
+          type: "lvr:reportBsportsfanHealthy",
+          observedAt: Date.now(),
+          url: normalizeUrl(location.href)
+        }).catch(() => {});
         return;
       }
       stopTableTennisCollectorWork("data-sources-unavailable");
@@ -11834,6 +11907,10 @@
       }
     }).catch(() => {
       if (failedSourceId !== currentSourceId) {
+        tableTennisSourceFailoverStarted = false;
+        return;
+      }
+      if (isCurrentTableTennisSourcePageHealthy(document)) {
         tableTennisSourceFailoverStarted = false;
         return;
       }

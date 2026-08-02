@@ -174,6 +174,7 @@ let bsportsfanForecastLeaseMutationChain = Promise.resolve();
 let tableTennisSourceStateCache = null;
 let tableTennisSourceStateMutationChain = Promise.resolve();
 let tableTennisCollectorLeaseMutationChain = Promise.resolve();
+let bsportsfanAttentionNotificationChain = Promise.resolve();
 
 chrome.runtime.onInstalled.addListener(() => {
   ensureBootstrapStorage().catch(() => {});
@@ -233,11 +234,6 @@ function ensureBsportsfanHealthAlarm() {
 
 async function runBsportsfanHealthWatchdog(now = Date.now()) {
   await ensureBsportsfanProtectionStateLoaded();
-  const betsapiCircuitError = getBsportsfanProtectionCircuitError("betsapi", now);
-  const bsportsfanCircuitError = getBsportsfanProtectionCircuitError("bsportsfan", now);
-  if (betsapiCircuitError && bsportsfanCircuitError) {
-    return { reloaded: false, reason: "protection-active" };
-  }
   const storage = await chrome.storage.local.get({
     scanStatus: null,
     [BSPORTSFAN_HEALTH_WATCHDOG_STORAGE_KEY]: null
@@ -245,6 +241,12 @@ async function runBsportsfanHealthWatchdog(now = Date.now()) {
   const scanStatus = storage.scanStatus && typeof storage.scanStatus === "object"
     ? storage.scanStatus
     : null;
+  await reconcileTableTennisSourceHealthFromScanStatus(scanStatus, now).catch(() => {});
+  const betsapiCircuitError = getBsportsfanProtectionCircuitError("betsapi", now);
+  const bsportsfanCircuitError = getBsportsfanProtectionCircuitError("bsportsfan", now);
+  if (betsapiCircuitError && bsportsfanCircuitError) {
+    return { reloaded: false, reason: "protection-active" };
+  }
   const heartbeatAt = Number(scanStatus && scanStatus.ts || 0);
   const heartbeatStale = !(heartbeatAt > 0) || now - heartbeatAt >= BSPORTSFAN_HEALTH_STALE_MS;
   const progress = summarizeBsportsfanCollectorProgress(scanStatus, now);
@@ -464,18 +466,40 @@ async function handleMessage(message, sender = null) {
   }
 
   if (message.type === "lvr:setScanStatus") {
+    validateBsportsfanProxySender(sender);
+    const senderSourceId = getTableTennisDataSourceId(
+      message.status && message.status.bsportsfan && message.status.bsportsfan.url
+      || sender && sender.url
+      || ""
+    );
+    const collectorLease = senderSourceId
+      ? await getConfirmedTableTennisCollectorLease(sender, senderSourceId)
+      : null;
+    if (!collectorLease) {
+      return {
+        ignored: true,
+        reason: "non-collector-scan-status"
+      };
+    }
     const status = {
       ...(message.status || {}),
+      collector: {
+        tabId: Number(collectorLease.tabId),
+        sourceId: senderSourceId,
+        leaseUpdatedAt: Number(collectorLease.updatedAt || 0)
+      },
       ts: Date.now()
     };
     await chrome.storage.local.set({ scanStatus: status });
+    const sourceHealth = await reconcileTableTennisSourceHealthFromScanStatus(status)
+      .catch(() => ({ cleared: false, sourceId: "" }));
     const resultEditRetry = await maybeRetryPendingTelegramPredictionResultEdit()
       .catch((error) => ({
         retried: false,
         reason: "retry-error",
         error: stringifyError(error)
       }));
-    return { status, resultEditRetry };
+    return { status, sourceHealth, resultEditRetry };
   }
 
   if (message.type === "lvr:getScanStatus") {
@@ -545,6 +569,41 @@ async function handleMessage(message, sender = null) {
   if (message.type === "lvr:reportBsportsfanProtection") {
     validateBsportsfanProxySender(sender);
     await ensureBsportsfanProtectionStateLoaded();
+    const pageSourceId = getTableTennisDataSourceId(
+      message.url || sender && sender.url || ""
+    );
+    const collectorConfirmed = Boolean(
+      await getConfirmedTableTennisCollectorLease(sender, pageSourceId)
+    );
+    if (message.visibleFailure !== true || !pageSourceId || !collectorConfirmed) {
+      const sourceState = await getTableTennisSourceState();
+      return {
+        reported: false,
+        reason: collectorConfirmed
+          ? "non-visible-source-failure"
+          : "non-collector-source-failure",
+        ...buildTableTennisSourceRoute(sourceState, {
+          currentSourceId: pageSourceId
+        })
+      };
+    }
+    const failureObservedAt = Math.min(
+      Date.now(),
+      Math.max(0, Number(message.observedAt || 0) || Date.now())
+    );
+    const stateBeforeFailure = await getTableTennisSourceState();
+    if (
+      failureObservedAt
+      < Number(stateBeforeFailure.sources[pageSourceId].lastHealthyAt || 0)
+    ) {
+      return {
+        reported: false,
+        reason: "stale-visible-source-failure",
+        ...buildTableTennisSourceRoute(stateBeforeFailure, {
+          currentSourceId: pageSourceId
+        })
+      };
+    }
     const manualRequired = message.manualRequired === true;
     const rateLimited = Number(message.status || 0) === 429
       || normalizeTelegramText(message.code || "") === "bsportsfan-rate-limited";
@@ -570,16 +629,13 @@ async function handleMessage(message, sender = null) {
         Number(message.retryAfterMs || 0) || 0
       )
     );
-    const sourceId = TABLE_TENNIS_SOURCE_ORIGINS[message.sourceId]
-      ? message.sourceId
-      : getTableTennisDataSourceId(
-          message.url || sender && sender.url || ""
-        ) || "bsportsfan";
+    const sourceId = pageSourceId;
     openBsportsfanProtectionCircuit(
       normalizeTelegramText(message.reason || message.code || "bsportsfan-challenge"),
       Number(message.status || 0) || 0,
       requestedCooldownMs,
-      sourceId
+      sourceId,
+      failureObservedAt
     );
     const sourceState = await getTableTennisSourceState();
     scheduleTelegramStatsRefresh("collector-protection", {
@@ -590,7 +646,7 @@ async function handleMessage(message, sender = null) {
       reported: true,
       retryAfterMs: Math.max(0, getTableTennisSourceProtectionOpenUntil(sourceId) - Date.now()),
       ...buildTableTennisSourceRoute(sourceState, {
-        currentSourceId: sourceId
+        currentSourceId: pageSourceId
       })
     };
   }
@@ -605,10 +661,49 @@ async function handleMessage(message, sender = null) {
     const sourceId = getTableTennisDataSourceId(
       message.url || sender && sender.url || ""
     );
-    const sourceState = sourceId
-      ? await markTableTennisSourceHealthy(sourceId)
-      : await getTableTennisSourceState();
-    const cleared = await closeBsportsfanProtectionCircuit(sourceId);
+    const collectorConfirmed = Boolean(
+      sourceId && await getConfirmedTableTennisCollectorLease(sender, sourceId)
+    );
+    if (!collectorConfirmed) {
+      const sourceState = await getTableTennisSourceState();
+      return {
+        healthy: true,
+        cleared: false,
+        reason: "non-collector-health-report",
+        ...buildTableTennisSourceRoute(sourceState, {
+          currentSourceId: sourceId
+        })
+      };
+    }
+    const currentSourceState = await getTableTennisSourceState();
+    const currentSource = sourceId && currentSourceState.sources[sourceId] || {};
+    const healthObservedAt = Math.min(
+      Date.now(),
+      Math.max(0, Number(message.observedAt || 0) || Date.now())
+    );
+    if (healthObservedAt < Number(currentSource.lastFailureAt || 0)) {
+      return {
+        healthy: true,
+        cleared: false,
+        reason: "stale-collector-health-report",
+        ...buildTableTennisSourceRoute(currentSourceState, {
+          currentSourceId: sourceId
+        })
+      };
+    }
+    const stateRecovered = Boolean(sourceId && (
+      Number(currentSource.cooldownUntil || 0) > Date.now()
+      || Number(currentSource.lastFailureAt || 0) > Number(currentSource.lastHealthyAt || 0)
+    ));
+    const sourceState = healthObservedAt > Number(currentSource.lastHealthyAt || 0)
+      ? await markTableTennisSourceHealthy(sourceId, { observedAt: healthObservedAt })
+      : currentSourceState;
+    const cleared = sourceId
+      ? await closeBsportsfanProtectionCircuit(sourceId)
+      : false;
+    if (stateRecovered || cleared) {
+      await chrome.storage.local.remove(BSPORTSFAN_ATTENTION_NOTIFICATION_KEY).catch(() => {});
+    }
     if (cleared) {
       scheduleTelegramStatsRefresh("collector-healthy", {
         createMissing: false,
@@ -939,6 +1034,9 @@ async function clearBsportsfanTransientRuntimeState(clearProtection = false) {
       await chrome.tabs.remove(recoveryTabId).catch(() => {});
     }
   }
+  if (clearProtection) {
+    await chrome.storage.local.remove(BSPORTSFAN_ATTENTION_NOTIFICATION_KEY).catch(() => {});
+  }
 }
 
 async function fetchBsportsfanTextShared(value, options = {}) {
@@ -1178,12 +1276,43 @@ function isSameBsportsfanRequestOwner(leftValue, rightValue) {
   return Boolean(left && right && left === right);
 }
 
-async function notifyBsportsfanAttention(value = {}) {
-  const now = Date.now();
-  const storage = await chrome.storage.local.get({
-    [BSPORTSFAN_ATTENTION_NOTIFICATION_KEY]: null
+function notifyBsportsfanAttention(value = {}) {
+  const operation = bsportsfanAttentionNotificationChain
+    .catch(() => {})
+    .then(() => notifyBsportsfanAttentionNow(value));
+  bsportsfanAttentionNotificationChain = operation.then(() => undefined, () => undefined);
+  return operation;
+}
+
+function areBothTableTennisSourcesUnavailable(sourceState, now = Date.now()) {
+  return ["betsapi", "bsportsfan"].every((sourceId) => {
+    const source = sourceState && sourceState.sources && sourceState.sources[sourceId] || {};
+    return Number(source.cooldownUntil || 0) > now
+      && Number(source.lastFailureAt || 0) > Number(source.lastHealthyAt || 0);
   });
-  const previous = storage && storage[BSPORTSFAN_ATTENTION_NOTIFICATION_KEY];
+}
+
+async function notifyBsportsfanAttentionNow(value = {}) {
+  await new Promise((resolve) => setTimeout(resolve, 5000));
+  await ensureBsportsfanProtectionStateLoaded();
+  const now = Date.now();
+  const kind = normalizeTelegramText(value.kind || value.code || "security-challenge");
+  const stored = await chrome.storage.local.get({
+    [BSPORTSFAN_ATTENTION_NOTIFICATION_KEY]: null,
+    scanStatus: null
+  });
+  await reconcileTableTennisSourceHealthFromScanStatus(stored.scanStatus, now).catch(() => {});
+  const sourceState = await getTableTennisSourceState();
+  const bothUnavailable = areBothTableTennisSourcesUnavailable(sourceState, now);
+  if (!bothUnavailable) {
+    await chrome.storage.local.remove(BSPORTSFAN_ATTENTION_NOTIFICATION_KEY).catch(() => {});
+    return {
+      notified: false,
+      reason: "healthy-source-available"
+    };
+  }
+
+  const previous = stored && stored[BSPORTSFAN_ATTENTION_NOTIFICATION_KEY];
   const previousAt = Number(previous && previous.notifiedAt || 0);
   if (previousAt > 0 && now - previousAt < BSPORTSFAN_ATTENTION_NOTIFICATION_TTL_MS) {
     return {
@@ -1193,18 +1322,19 @@ async function notifyBsportsfanAttention(value = {}) {
     };
   }
 
-  const kind = normalizeTelegramText(value.kind || value.code || "security-challenge");
-  await chrome.storage.local.set({
-    [BSPORTSFAN_ATTENTION_NOTIFICATION_KEY]: {
-      kind,
-      notifiedAt: now,
-      observedAt: Number(value.observedAt || 0) || now
-    }
-  });
-
   const settings = await getTelegramSettings();
   if (!settings.enabled || !settings.botToken || !settings.chatId) {
     return { notified: false, reason: "telegram-disabled" };
+  }
+  const latestStored = await chrome.storage.local.get({ scanStatus: null });
+  await reconcileTableTennisSourceHealthFromScanStatus(latestStored.scanStatus).catch(() => {});
+  const latestSourceState = await getTableTennisSourceState();
+  if (!areBothTableTennisSourcesUnavailable(latestSourceState)) {
+    await chrome.storage.local.remove(BSPORTSFAN_ATTENTION_NOTIFICATION_KEY).catch(() => {});
+    return {
+      notified: false,
+      reason: "source-recovered-before-notification"
+    };
   }
   const sessionExpired = kind === "session-expired";
   const text = sessionExpired
@@ -1219,13 +1349,30 @@ async function notifyBsportsfanAttention(value = {}) {
         "Ручное действие потребуется только если оба сайта продолжат показывать CAPTCHA."
       ].join("\n");
   const result = await sendTelegramMessage(text, settings);
+  await chrome.storage.local.set({
+    [BSPORTSFAN_ATTENTION_NOTIFICATION_KEY]: {
+      kind,
+      notifiedAt: Date.now(),
+      observedAt: Number(value.observedAt || 0) || now
+    }
+  });
   return { notified: true, result };
 }
 
 async function prepareBsportsfanLiveSessionRecovery(sender) {
   validateBsportsfanProxySender(sender);
   const owner = getBsportsfanRequestOwner(sender);
-  const sourceId = getTableTennisDataSourceId(sender && sender.url || "") || "bsportsfan";
+  const sourceId = getTableTennisDataSourceId(sender && sender.url || "");
+  const collectorConfirmed = Boolean(
+    sourceId && await getConfirmedTableTennisCollectorLease(sender, sourceId)
+  );
+  if (!collectorConfirmed) {
+    return {
+      prepared: false,
+      reason: "non-collector-session-recovery",
+      owner
+    };
+  }
   await Promise.all([
     ensureBsportsfanProtectionStateLoaded(),
     ensureBsportsfanForecastLeasesLoaded()
@@ -1697,7 +1844,8 @@ function openBsportsfanProtectionCircuit(
   reason,
   status = 0,
   cooldownMs = BSPORTSFAN_PROXY_PROTECTION_COOLDOWN_MS,
-  sourceId = "bsportsfan"
+  sourceId = "bsportsfan",
+  observedAt = Date.now()
 ) {
   const openUntil = Date.now() + Math.max(
     1000,
@@ -1737,7 +1885,8 @@ function openBsportsfanProtectionCircuit(
   }
   markTableTennisSourceFailure(normalizedSourceId, {
     reason,
-    retryAfterMs: Math.max(0, openUntil - Date.now())
+    retryAfterMs: Math.max(0, openUntil - Date.now()),
+    observedAt
   }).catch(() => {});
   const sessionStorage = chrome.storage && chrome.storage.session;
   if (
@@ -1821,6 +1970,8 @@ function getBsportsfanProtectionCircuitError(sourceId = "bsportsfan", now = Date
   );
   error.sourceId = normalizedSourceId;
   error.retryAfterMs = retryAfterMs;
+  error.endpointBlocked = true;
+  error.retryBudgetExempt = true;
   return error;
 }
 
@@ -1832,6 +1983,8 @@ function cloneBsportsfanProtectionError(source) {
   error.status = Number(source && source.status || 0) || 0;
   error.retryAfterMs = Math.max(0, Number(source && source.retryAfterMs || 0) || 0);
   error.sourceId = normalizeTelegramText(source && source.sourceId || "");
+  error.endpointBlocked = source && source.endpointBlocked === true;
+  error.retryBudgetExempt = source && source.retryBudgetExempt === true;
   return error;
 }
 
@@ -2078,6 +2231,10 @@ function markTableTennisSourceFailure(sourceId, options = {}) {
     return getTableTennisSourceState();
   }
   const now = Date.now();
+  const observedAt = Math.min(
+    now,
+    Math.max(0, Number(options.observedAt || 0) || now)
+  );
   const retryAfterMs = Math.max(
     60 * 1000,
     Number(options.retryAfterMs || 0) || TABLE_TENNIS_SOURCE_FAILURE_COOLDOWN_MS
@@ -2086,7 +2243,7 @@ function markTableTennisSourceFailure(sourceId, options = {}) {
     const source = state.sources[sourceId];
     source.cooldownUntil = Math.max(source.cooldownUntil, now + retryAfterMs);
     source.failureCount = Math.min(100, source.failureCount + 1);
-    source.lastFailureAt = now;
+    source.lastFailureAt = Math.max(Number(source.lastFailureAt || 0), observedAt);
     source.reason = normalizeTelegramText(options.reason || "source-unavailable");
     const fallbackId = sourceId === "betsapi" ? "bsportsfan" : "betsapi";
     if (Number(state.sources[fallbackId].cooldownUntil || 0) <= now) {
@@ -2096,16 +2253,20 @@ function markTableTennisSourceFailure(sourceId, options = {}) {
   });
 }
 
-function markTableTennisSourceHealthy(sourceId) {
+function markTableTennisSourceHealthy(sourceId, options = {}) {
   if (!TABLE_TENNIS_SOURCE_ORIGINS[sourceId]) {
     return getTableTennisSourceState();
   }
   const now = Date.now();
+  const observedAt = Math.min(
+    now,
+    Math.max(0, Number(options.observedAt || 0) || now)
+  );
   return mutateTableTennisSourceState((state) => {
     const source = state.sources[sourceId];
     source.cooldownUntil = 0;
     source.failureCount = 0;
-    source.lastHealthyAt = now;
+    source.lastHealthyAt = Math.max(Number(source.lastHealthyAt || 0), observedAt);
     source.reason = "";
     return state;
   });
@@ -2123,6 +2284,79 @@ async function markTableTennisSourceActive(sourceId) {
     state.activeSourceId = sourceId;
     return state;
   });
+}
+
+function getHealthyTableTennisScanSourceId(scanStatus, sourceState, now = Date.now()) {
+  const status = scanStatus && typeof scanStatus === "object" ? scanStatus : {};
+  const heartbeatAt = Math.max(0, Number(status.ts || 0) || 0);
+  if (
+    normalizeTelegramText(status.source || "").toLowerCase() !== "table-tennis"
+    || !(heartbeatAt > 0)
+    || now - heartbeatAt > BSPORTSFAN_HEALTH_STALE_MS
+  ) {
+    return "";
+  }
+  const snapshot = status.bsportsfan && typeof status.bsportsfan === "object"
+    ? status.bsportsfan
+    : {};
+  const observedAt = Math.max(0, Number(snapshot.ts || heartbeatAt) || heartbeatAt);
+  const recovery = snapshot.sessionRecovery && typeof snapshot.sessionRecovery === "object"
+    ? snapshot.sessionRecovery
+    : {};
+  const monitor = snapshot.cipMonitor && typeof snapshot.cipMonitor === "object"
+    ? snapshot.cipMonitor
+    : {};
+  if (
+    snapshot.challenge === true
+    || recovery.active === true
+    || monitor.active !== true
+  ) {
+    return "";
+  }
+  const sourceId = getTableTennisDataSourceId(snapshot.url || "")
+    || (TABLE_TENNIS_SOURCE_ORIGINS[snapshot.dataSource] ? snapshot.dataSource : "")
+    || (TABLE_TENNIS_SOURCE_ORIGINS[monitor.sourceId] ? monitor.sourceId : "");
+  if (!sourceId) {
+    return "";
+  }
+  const source = sourceState && sourceState.sources && sourceState.sources[sourceId] || {};
+  return observedAt >= Number(source.lastFailureAt || 0) ? sourceId : "";
+}
+
+async function reconcileTableTennisSourceHealthFromScanStatus(scanStatus, now = Date.now()) {
+  await ensureBsportsfanProtectionStateLoaded();
+  const collectorLease = await getTableTennisCollectorLease().catch(() => null);
+  const recordedCollector = scanStatus && typeof scanStatus.collector === "object"
+    ? scanStatus.collector
+    : {};
+  if (
+    !collectorLease
+    || Number(recordedCollector.tabId) !== Number(collectorLease.tabId)
+    || normalizeTelegramText(recordedCollector.sourceId || "")
+      !== normalizeTelegramText(collectorLease.sourceId || "")
+  ) {
+    return { cleared: false, sourceId: "" };
+  }
+  const sourceState = await getTableTennisSourceState();
+  const sourceId = getHealthyTableTennisScanSourceId(scanStatus, sourceState, now);
+  if (!sourceId) {
+    return { cleared: false, sourceId: "" };
+  }
+  const source = sourceState.sources[sourceId] || {};
+  const needsRecovery = Number(source.cooldownUntil || 0) > now
+    || Number(source.lastFailureAt || 0) > Number(source.lastHealthyAt || 0)
+    || getTableTennisSourceProtectionOpenUntil(sourceId) > now;
+  if (!needsRecovery) {
+    return { cleared: false, sourceId };
+  }
+  await markTableTennisSourceHealthy(sourceId);
+  const circuitCleared = await closeBsportsfanProtectionCircuit(sourceId);
+  await chrome.storage.local.remove(BSPORTSFAN_ATTENTION_NOTIFICATION_KEY).catch(() => {});
+  return {
+    cleared: true,
+    circuitCleared,
+    sourceId
+  };
 }
 
 function buildTableTennisSourceRoute(stateValue, options = {}) {
@@ -2283,6 +2517,23 @@ async function getTableTennisCollectorLease() {
   }).catch(() => ({}));
   const lease = stored && stored[TABLE_TENNIS_COLLECTOR_LEASE_STORAGE_KEY];
   return lease && Number(lease.leaseUntil || 0) > Date.now() ? lease : null;
+}
+
+async function getConfirmedTableTennisCollectorLease(sender, sourceId = "") {
+  const lease = await getTableTennisCollectorLease().catch(() => null);
+  const senderTabId = Number(sender && sender.tab && sender.tab.id);
+  const senderSourceId = TABLE_TENNIS_SOURCE_ORIGINS[sourceId]
+    ? sourceId
+    : getTableTennisDataSourceId(sender && sender.url || "");
+  if (
+    !lease
+    || !Number.isInteger(senderTabId)
+    || Number(lease.tabId) !== senderTabId
+    || normalizeTelegramText(lease.sourceId || "") !== senderSourceId
+  ) {
+    return null;
+  }
+  return lease;
 }
 
 function validateBsportsfanProxyRequest(value, sender) {
