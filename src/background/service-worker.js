@@ -105,7 +105,6 @@ const BSPORTSFAN_TAB_RELOAD_INTERVAL_MS = 2500;
 const BSPORTSFAN_RESULT_RECOVERY_NAVIGATION_DELAY_MS = 12 * 1000;
 const BSPORTSFAN_RESULT_RECOVERY_MIN_AGE_MS = 20 * 60 * 1000;
 const TABLE_TENNIS_SOURCE_STATE_KEY = "tableTennisSourceStateV1";
-const TABLE_TENNIS_PRIMARY_SOURCE_ID = "betsapi";
 const TABLE_TENNIS_SOURCE_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
 const TABLE_TENNIS_ENDPOINT_BLOCKED_CODE = "table-tennis-endpoint-blocked";
 const TABLE_TENNIS_ENDPOINT_BLOCKED_RETRY_MS = 5 * 60 * 1000;
@@ -293,12 +292,29 @@ async function runBsportsfanHealthWatchdog(now = Date.now()) {
       "https://*.betsapi.com/*"
     ]
   }).catch(() => []);
+  const lastFocusedActiveTabs = await chrome.tabs.query({
+    active: true,
+    lastFocusedWindow: true
+  }).catch(() => []);
+  const lastFocusedActiveTabIds = new Set(
+    (Array.isArray(lastFocusedActiveTabs) ? lastFocusedActiveTabs : [])
+      .map((tab) => Number(tab && tab.id))
+      .filter(Number.isInteger)
+  );
+  const sourceState = await getTableTennisSourceState().catch(() => (
+    createDefaultTableTennisSourceState()
+  ));
+  const preferredSourceId = TABLE_TENNIS_SOURCE_ORIGINS[sourceState.activeSourceId]
+    ? sourceState.activeSourceId
+    : statusSourceId;
   const allCandidates = (Array.isArray(tabs) ? tabs : [])
     .filter((tab) => Number.isInteger(tab && tab.id))
     .sort((left, right) => {
       const listRank = (tab) => /\/(?:cip|c)\/table-tennis\/?(?:[?#]|$)/i.test(String(tab && tab.url || "")) ? 0 : 1;
-      const sourceRank = (tab) => /https:\/\/(?:[^/]+\.)?betsapi\.com\//i.test(String(tab && tab.url || "")) ? 0 : 1;
+      const focusedRank = (tab) => lastFocusedActiveTabIds.has(Number(tab && tab.id)) ? 0 : 1;
+      const sourceRank = (tab) => getTableTennisDataSourceId(tab && tab.url || "") === preferredSourceId ? 0 : 1;
       return listRank(left) - listRank(right)
+        || focusedRank(left) - focusedRank(right)
         || sourceRank(left) - sourceRank(right)
         || Number(Boolean(right && right.active)) - Number(Boolean(left && left.active));
     });
@@ -479,14 +495,15 @@ async function handleMessage(message, sender = null) {
         })
       : await getTableTennisSourceState();
     return buildTableTennisSourceRoute(state, {
-      currentSourceId: sourceId,
-      preferPrimary: message.preferPrimary !== false
+      currentSourceId: sourceId
     });
   }
 
   if (message.type === "lvr:claimTableTennisCollector") {
     validateBsportsfanProxySender(sender);
-    return claimTableTennisCollectorLease(sender, message.url);
+    return claimTableTennisCollectorLease(sender, message.url, {
+      allowActiveTabTakeover: message.allowActiveTabTakeover === true
+    });
   }
 
   if (message.type === "lvr:getTableTennisCollector") {
@@ -573,8 +590,7 @@ async function handleMessage(message, sender = null) {
       reported: true,
       retryAfterMs: Math.max(0, getTableTennisSourceProtectionOpenUntil(sourceId) - Date.now()),
       ...buildTableTennisSourceRoute(sourceState, {
-        currentSourceId: sourceId,
-        preferPrimary: true
+        currentSourceId: sourceId
       })
     };
   }
@@ -603,8 +619,7 @@ async function handleMessage(message, sender = null) {
       healthy: true,
       cleared,
       ...buildTableTennisSourceRoute(sourceState, {
-        currentSourceId: sourceId,
-        preferPrimary: true
+        currentSourceId: sourceId
       })
     };
   }
@@ -1969,8 +1984,7 @@ function getTableTennisDataSourceId(value) {
 function createDefaultTableTennisSourceState() {
   return {
     version: 1,
-    primarySourceId: TABLE_TENNIS_PRIMARY_SOURCE_ID,
-    activeSourceId: TABLE_TENNIS_PRIMARY_SOURCE_ID,
+    activeSourceId: "",
     updatedAt: 0,
     sources: {
       betsapi: {
@@ -2009,7 +2023,6 @@ function normalizeTableTennisSourceState(value) {
     : defaults.activeSourceId;
   return {
     version: 1,
-    primarySourceId: TABLE_TENNIS_PRIMARY_SOURCE_ID,
     activeSourceId,
     updatedAt: Math.max(0, Number(raw.updatedAt || 0) || 0),
     sources: {
@@ -2118,22 +2131,31 @@ function buildTableTennisSourceRoute(stateValue, options = {}) {
   const available = (sourceId) => Number(
     state.sources[sourceId] && state.sources[sourceId].cooldownUntil || 0
   ) <= now;
-  let targetSourceId = "";
-  if (available(TABLE_TENNIS_PRIMARY_SOURCE_ID)) {
-    targetSourceId = TABLE_TENNIS_PRIMARY_SOURCE_ID;
-  } else if (available("bsportsfan")) {
-    targetSourceId = "bsportsfan";
-  }
+  const currentSourceId = TABLE_TENNIS_SOURCE_ORIGINS[options.currentSourceId]
+    ? options.currentSourceId
+    : "";
+  const alternateSourceId = currentSourceId === "betsapi"
+    ? "bsportsfan"
+    : currentSourceId === "bsportsfan"
+      ? "betsapi"
+      : "";
+  const candidates = [
+    currentSourceId,
+    alternateSourceId,
+    state.activeSourceId,
+    "betsapi",
+    "bsportsfan"
+  ].filter((sourceId, index, values) => (
+    TABLE_TENNIS_SOURCE_ORIGINS[sourceId]
+    && values.indexOf(sourceId) === index
+  ));
+  const targetSourceId = candidates.find(available) || "";
   const retryAt = targetSourceId
     ? 0
     : Math.min(...Object.values(state.sources)
         .map((source) => Number(source && source.cooldownUntil || 0))
         .filter((value) => value > now));
-  const currentSourceId = TABLE_TENNIS_SOURCE_ORIGINS[options.currentSourceId]
-    ? options.currentSourceId
-    : "";
   return {
-    primarySourceId: TABLE_TENNIS_PRIMARY_SOURCE_ID,
     activeSourceId: targetSourceId || state.activeSourceId,
     currentSourceId,
     targetSourceId,
@@ -2148,7 +2170,7 @@ function buildTableTennisSourceRoute(stateValue, options = {}) {
   };
 }
 
-function claimTableTennisCollectorLease(sender, value) {
+function claimTableTennisCollectorLease(sender, value, options = {}) {
   const operation = tableTennisCollectorLeaseMutationChain
     .catch(() => {})
     .then(async () => {
@@ -2179,9 +2201,33 @@ function claimTableTennisCollectorLease(sender, value) {
           existingActive = false;
         }
       }
+      const existingSourceId = getTableTennisDataSourceId(
+        existing && existing.sourceId || ""
+      ) || normalizeTelegramText(existing && existing.sourceId || "");
+      const activeTabTakeoverCandidate = Boolean(
+        options.allowActiveTabTakeover === true
+        && sender && sender.tab && sender.tab.active === true
+        && sourceId
+        && existingSourceId
+        && sourceId !== existingSourceId
+      );
+      let activeTabTakeover = activeTabTakeoverCandidate;
+      if (
+        activeTabTakeoverCandidate
+        && chrome.tabs
+        && typeof chrome.tabs.query === "function"
+      ) {
+        const focusedTabs = await chrome.tabs.query({
+          active: true,
+          lastFocusedWindow: true
+        }).catch(() => []);
+        activeTabTakeover = (Array.isArray(focusedTabs) ? focusedTabs : [])
+          .some((tab) => Number(tab && tab.id) === tabId);
+      }
       if (
         existingActive
         && !isSameBsportsfanRequestOwner(existing.owner, owner)
+        && !activeTabTakeover
       ) {
         return {
           leader: false,
@@ -2201,6 +2247,19 @@ function claimTableTennisCollectorLease(sender, value) {
       if (sessionStorage && typeof sessionStorage.set === "function") {
         await sessionStorage.set({
           [TABLE_TENNIS_COLLECTOR_LEASE_STORAGE_KEY]: lease
+        }).catch(() => {});
+      }
+      if (
+        activeTabTakeover
+        && Number.isInteger(Number(existing && existing.tabId))
+        && Number(existing.tabId) !== tabId
+        && chrome.tabs
+        && typeof chrome.tabs.sendMessage === "function"
+      ) {
+        await chrome.tabs.sendMessage(Number(existing.tabId), {
+          type: "lvr:tableTennisCollectorLeaseRevoked",
+          replacementTabId: tabId,
+          replacementSourceId: sourceId
         }).catch(() => {});
       }
       await markTableTennisSourceActive(sourceId).catch(() => {});
@@ -8483,7 +8542,6 @@ async function getTelegramPipelineStatus() {
         : 0,
       protectionReason: "",
       activeSourceId: sourceState.activeSourceId,
-      primarySourceId: sourceState.primarySourceId,
       sources: sourceState.sources,
       queuedByPriority: summarizeBsportsfanProxyQueuePriorities(),
       metrics: { ...bsportsfanProxyFetchMetrics }

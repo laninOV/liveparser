@@ -426,9 +426,9 @@ function formatBsportsfanNetworkStatus(network) {
   const protectionOpenUntil = Number(snapshot.protectionOpenUntil || 0);
   const activeSource = String(snapshot.activeSourceId || "");
   const sourceLabel = activeSource === "betsapi"
-    ? "BetsAPI основной"
+    ? "BetsAPI"
     : activeSource === "bsportsfan"
-      ? "BSportsFan резерв"
+      ? "BSportsFan"
       : "источник определяется";
   if (protectionOpenUntil > Date.now()) {
     return `оба недоступны до ${formatDateTime(protectionOpenUntil)}`;
@@ -541,11 +541,11 @@ async function backfillArchiveResults() {
       return;
     }
     if (status === "bsportsfan-protection") {
-      setArchiveActionStatus("Основной источник недоступен — включается резервный. Досбор продолжится автоматически.");
+      setArchiveActionStatus("Текущий источник недоступен — включается второй. Досбор продолжится автоматически.");
       return;
     }
     if (status === "bsportsfan-protection-opened") {
-      setArchiveActionStatus("Открыт резервный источник результатов. Итоги дособерутся автоматически.");
+      setArchiveActionStatus("Открыт второй источник результатов. Итоги дособерутся автоматически.");
       return;
     }
     if (status === "runtime-unavailable") {

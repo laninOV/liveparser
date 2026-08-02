@@ -34,7 +34,6 @@
     && typeof globalThis.crypto.randomUUID === "function"
     ? globalThis.crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const TABLE_TENNIS_SOURCE_ROUTE_CHECK_INTERVAL_MS = 60 * 1000;
   const TABLE_TENNIS_COLLECTOR_RETRY_INTERVAL_MS = 10 * 1000;
   const MUTATION_DELAY_MS = 250;
   const MUTATION_MIN_UPDATE_INTERVAL_MS = 3000;
@@ -127,7 +126,7 @@
   const playerMatchesCache = new Map();
   const oddsMarketCache = new Map();
   const oddsMarketNegativeCache = new Map();
-  const tableTennisEndpointFallbackUntil = new Map();
+  const tableTennisEndpointRouteOverrides = new Map();
   const openingOddsRecoveryDone = new Map();
   const openingOddsRowPatchState = new Map();
   const ODDS_MARKET_NEGATIVE_CACHE_MS = 2 * 60 * 1000;
@@ -203,10 +202,6 @@
     installTelegramPredictionResultAutoBackfill();
     updateSnapshot("ready");
     window.setInterval(() => updateSnapshot("interval"), UPDATE_INTERVAL_MS);
-    window.setInterval(
-      () => maybeRestorePrimaryTableTennisSource(),
-      TABLE_TENNIS_SOURCE_ROUTE_CHECK_INTERVAL_MS
-    );
   });
 
   async function prepareTableTennisDataSourceBeforeCollection() {
@@ -242,7 +237,8 @@
     }
     const lease = await sendRuntimeMessage({
       type: "lvr:claimTableTennisCollector",
-      url: normalizeUrl(location.href)
+      url: normalizeUrl(location.href),
+      allowActiveTabTakeover: true
     }).catch(() => null);
     tableTennisCollectorLeadershipActive = !lease || lease.leader !== false;
     installTableTennisCollectorHeartbeat();
@@ -834,7 +830,25 @@
         message.type !== "lvr:collectNow"
         && message.type !== "lvr:collectPlayerArchive"
         && message.type !== "lvr:telegramAction"
+        && message.type !== "lvr:tableTennisCollectorLeaseRevoked"
       )) {
+        return false;
+      }
+
+      if (message.type === "lvr:tableTennisCollectorLeaseRevoked") {
+        tableTennisCollectorLeadershipActive = false;
+        stopTableTennisCollectorWork("collector-leadership-revoked");
+        window.__liveValueRadarBsportsfanCipMonitor = {
+          ts: Date.now(),
+          active: false,
+          passive: true,
+          sourceId: getCurrentTableTennisSourceId(),
+          visibleRows: 0,
+          waitingRows: 0,
+          forecastQueueSize: 0,
+          forecastActiveWorkers: inlineAutoForecastActiveWorkers
+        };
+        sendResponse({ ok: true });
         return false;
       }
 
@@ -4028,7 +4042,11 @@
 
   async function fetchAndSyncTelegramPredictionResultsPage(options = {}) {
     const config = options && typeof options === "object" ? options : {};
-    let resultsUrl = normalizeUrl(RESULTS_PATH, location.origin);
+    let resultsUrl = preferTableTennisEndpointUrl(
+      normalizeUrl(RESULTS_PATH, location.origin),
+      "results"
+    );
+    let sourceFallbackAttempted = false;
     let html = "";
     try {
       html = await loadTelegramPredictionResultsPageInFrame(resultsUrl, {
@@ -4039,13 +4057,12 @@
       let frameError = error;
       if (
         isTableTennisEndpointBlockedError(error)
-        && isBetsapiDataHostname(parseUrl(resultsUrl) && parseUrl(resultsUrl).hostname)
+        && !sourceFallbackAttempted
+        && getTableTennisDataSourceId(resultsUrl)
       ) {
-        markBetsapiEndpointFallback("results");
-        resultsUrl = rebaseTableTennisDataUrl(
-          resultsUrl,
-          BSPORTSFAN_TABLE_TENNIS_ORIGIN
-        );
+        markTableTennisEndpointFallback("results", resultsUrl);
+        resultsUrl = getAlternateTableTennisDataUrl(resultsUrl);
+        sourceFallbackAttempted = true;
         try {
           html = await loadTelegramPredictionResultsPageInFrame(resultsUrl, {
             deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS,
@@ -4070,15 +4087,14 @@
         } catch (fetchError) {
           if (
             !isTableTennisEndpointBlockedError(fetchError)
-            || !isBetsapiDataHostname(parseUrl(resultsUrl) && parseUrl(resultsUrl).hostname)
+            || sourceFallbackAttempted
+            || !getTableTennisDataSourceId(resultsUrl)
           ) {
             throw fetchError;
           }
-          markBetsapiEndpointFallback("results");
-          resultsUrl = rebaseTableTennisDataUrl(
-            resultsUrl,
-            BSPORTSFAN_TABLE_TENNIS_ORIGIN
-          );
+          markTableTennisEndpointFallback("results", resultsUrl);
+          resultsUrl = getAlternateTableTennisDataUrl(resultsUrl);
+          sourceFallbackAttempted = true;
           html = await fetchText(resultsUrl, {
             cacheTtlMs: config.requestPriority === "interactive" ? 1 : 30 * 1000,
             deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS,
@@ -4525,6 +4541,7 @@
       rebaseTableTennisDataUrl(matchUrl),
       "results"
     );
+    let sourceFallbackAttempted = false;
     let sourceRow = sourceMatchUrl === matchUrl
       ? row
       : { ...row, matchUrl: sourceMatchUrl };
@@ -4540,13 +4557,12 @@
       } catch (error) {
         if (
           isTableTennisEndpointBlockedError(error)
-          && isBetsapiDataHostname(parseUrl(sourceMatchUrl) && parseUrl(sourceMatchUrl).hostname)
+          && !sourceFallbackAttempted
+          && getTableTennisDataSourceId(sourceMatchUrl)
         ) {
-          markBetsapiEndpointFallback("results");
-          sourceMatchUrl = rebaseTableTennisDataUrl(
-            sourceMatchUrl,
-            BSPORTSFAN_TABLE_TENNIS_ORIGIN
-          );
+          markTableTennisEndpointFallback("results", sourceMatchUrl);
+          sourceMatchUrl = getAlternateTableTennisDataUrl(sourceMatchUrl);
+          sourceFallbackAttempted = true;
           sourceRow = { ...row, matchUrl: sourceMatchUrl };
           try {
             const fallbackFrameResult = await loadTelegramPredictionFinalResultInFrame(sourceRow, {
@@ -4576,15 +4592,14 @@
     } catch (error) {
       if (
         !isTableTennisEndpointBlockedError(error)
-        || !isBetsapiDataHostname(parseUrl(sourceMatchUrl) && parseUrl(sourceMatchUrl).hostname)
+        || sourceFallbackAttempted
+        || !getTableTennisDataSourceId(sourceMatchUrl)
       ) {
         throw error;
       }
-      markBetsapiEndpointFallback("results");
-      sourceMatchUrl = rebaseTableTennisDataUrl(
-        sourceMatchUrl,
-        BSPORTSFAN_TABLE_TENNIS_ORIGIN
-      );
+      markTableTennisEndpointFallback("results", sourceMatchUrl);
+      sourceMatchUrl = getAlternateTableTennisDataUrl(sourceMatchUrl);
+      sourceFallbackAttempted = true;
       html = await fetchText(sourceMatchUrl, {
         cacheTtlMs: 1,
         deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS,
@@ -4598,14 +4613,11 @@
       row,
       "match-page-backfill"
     );
-    if (parsed || !isBetsapiDataHostname(parseUrl(sourceMatchUrl) && parseUrl(sourceMatchUrl).hostname)) {
+    if (parsed || sourceFallbackAttempted || !getTableTennisDataSourceId(sourceMatchUrl)) {
       return parsed;
     }
-    markBetsapiEndpointFallback("results");
-    const fallbackUrl = rebaseTableTennisDataUrl(
-      sourceMatchUrl,
-      BSPORTSFAN_TABLE_TENNIS_ORIGIN
-    );
+    markTableTennisEndpointFallback("results", sourceMatchUrl);
+    const fallbackUrl = getAlternateTableTennisDataUrl(sourceMatchUrl);
     const fallbackHtml = await fetchText(fallbackUrl, {
       cacheTtlMs: 1,
       deadlineAt: Date.now() + BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS,
@@ -9495,11 +9507,11 @@
       } catch (error) {
         if (
           isTableTennisEndpointBlockedError(error)
-          && isBetsapiDataHostname(parseUrl(url) && parseUrl(url).hostname)
+          && getTableTennisDataSourceId(url)
         ) {
-          markBetsapiEndpointFallback("match-pbp");
+          markTableTennisEndpointFallback("match-pbp", url);
           return fetchBsportsfanSnapshotUncached(
-            rebaseTableTennisDataUrl(url, BSPORTSFAN_TABLE_TENNIS_ORIGIN),
+            getAlternateTableTennisDataUrl(url),
             { ...options, sourceFallbackAttempted: true }
           );
         }
@@ -9529,10 +9541,13 @@
       }
       throw new Error(describeMissingGraph(snapshot, doc));
     } catch (error) {
-      if (isBetsapiDataHostname(parseUrl(url) && parseUrl(url).hostname)) {
-        markBetsapiEndpointFallback("match-pbp");
+      if (
+        options.sourceFallbackAttempted !== true
+        && getTableTennisDataSourceId(url)
+      ) {
+        markTableTennisEndpointFallback("match-pbp", url);
         return fetchBsportsfanSnapshotUncached(
-          rebaseTableTennisDataUrl(url, BSPORTSFAN_TABLE_TENNIS_ORIGIN),
+          getAlternateTableTennisDataUrl(url),
           { ...options, sourceFallbackAttempted: true }
         );
       }
@@ -9569,11 +9584,11 @@
       } catch (error) {
         if (
           isTableTennisEndpointBlockedError(error)
-          && isBetsapiDataHostname(parseUrl(url) && parseUrl(url).hostname)
+          && getTableTennisDataSourceId(url)
         ) {
-          markBetsapiEndpointFallback("match-page");
+          markTableTennisEndpointFallback("match-page", url);
           return fetchBsportsfanPageSnapshotUncached(
-            rebaseTableTennisDataUrl(url, BSPORTSFAN_TABLE_TENNIS_ORIGIN),
+            getAlternateTableTennisDataUrl(url),
             { ...options, sourceFallbackAttempted: true }
           );
         }
@@ -9603,10 +9618,13 @@
       }
       throw new Error(describeMissingPlayers(snapshot));
     } catch (error) {
-      if (isBetsapiDataHostname(parseUrl(url) && parseUrl(url).hostname)) {
-        markBetsapiEndpointFallback("match-page");
+      if (
+        options.sourceFallbackAttempted !== true
+        && getTableTennisDataSourceId(url)
+      ) {
+        markTableTennisEndpointFallback("match-page", url);
         return fetchBsportsfanPageSnapshotUncached(
-          rebaseTableTennisDataUrl(url, BSPORTSFAN_TABLE_TENNIS_ORIGIN),
+          getAlternateTableTennisDataUrl(url),
           { ...options, sourceFallbackAttempted: true }
         );
       }
@@ -9682,11 +9700,11 @@
         if (
           isTableTennisEndpointBlockedError(error)
           && context.sourceFallbackAttempted !== true
-          && isBetsapiDataHostname(parseUrl(oddsUrl) && parseUrl(oddsUrl).hostname)
+          && getTableTennisDataSourceId(oddsUrl)
         ) {
-          markBetsapiEndpointFallback("odds");
+          markTableTennisEndpointFallback("odds", oddsUrl);
           return fetchBsportsfanOddsMarketUncached(
-            rebaseTableTennisDataUrl(oddsUrl, BSPORTSFAN_TABLE_TENNIS_ORIGIN),
+            getAlternateTableTennisDataUrl(oddsUrl),
             { ...context, sourceFallbackAttempted: true, allowIframe: false }
           );
         }
@@ -9724,11 +9742,11 @@
       if (
         isTableTennisEndpointBlockedError(error)
         && context.sourceFallbackAttempted !== true
-        && isBetsapiDataHostname(parseUrl(oddsUrl) && parseUrl(oddsUrl).hostname)
+        && getTableTennisDataSourceId(oddsUrl)
       ) {
-        markBetsapiEndpointFallback("odds");
+        markTableTennisEndpointFallback("odds", oddsUrl);
         return fetchBsportsfanOddsMarketUncached(
-          rebaseTableTennisDataUrl(oddsUrl, BSPORTSFAN_TABLE_TENNIS_ORIGIN),
+          getAlternateTableTennisDataUrl(oddsUrl),
           { ...context, sourceFallbackAttempted: true, allowIframe: false }
         );
       }
@@ -9753,11 +9771,11 @@
     if (context && context.allowIframe === false) {
       if (
         context.sourceFallbackAttempted !== true
-        && isBetsapiDataHostname(parseUrl(oddsUrl) && parseUrl(oddsUrl).hostname)
+        && getTableTennisDataSourceId(oddsUrl)
       ) {
-        markBetsapiEndpointFallback("odds");
+        markTableTennisEndpointFallback("odds", oddsUrl);
         return fetchBsportsfanOddsMarketUncached(
-          rebaseTableTennisDataUrl(oddsUrl, BSPORTSFAN_TABLE_TENNIS_ORIGIN),
+          getAlternateTableTennisDataUrl(oddsUrl),
           { ...context, sourceFallbackAttempted: true, allowIframe: false }
         );
       }
@@ -9789,11 +9807,11 @@
     if (
       market.status !== "ready"
       && context.sourceFallbackAttempted !== true
-      && isBetsapiDataHostname(parseUrl(oddsUrl) && parseUrl(oddsUrl).hostname)
+      && getTableTennisDataSourceId(oddsUrl)
     ) {
-      markBetsapiEndpointFallback("odds");
+      markTableTennisEndpointFallback("odds", oddsUrl);
       return fetchBsportsfanOddsMarketUncached(
-        rebaseTableTennisDataUrl(oddsUrl, BSPORTSFAN_TABLE_TENNIS_ORIGIN),
+        getAlternateTableTennisDataUrl(oddsUrl),
         { ...context, sourceFallbackAttempted: true, allowIframe: false }
       );
     }
@@ -10110,11 +10128,11 @@
         if (
           isTableTennisEndpointBlockedError(error)
           && options.sourceFallbackAttempted !== true
-          && isBetsapiDataHostname(parseUrl(url) && parseUrl(url).hostname)
+          && getTableTennisDataSourceId(url)
         ) {
-          markBetsapiEndpointFallback("player-history");
+          markTableTennisEndpointFallback("player-history", url);
           return fetchPlayerResultMatchesUncached(
-            rebaseTableTennisDataUrl(url, BSPORTSFAN_TABLE_TENNIS_ORIGIN),
+            getAlternateTableTennisDataUrl(url),
             { ...options, sourceFallbackAttempted: true, allowIframe: false }
           );
         }
@@ -10154,7 +10172,7 @@
       if (
         isTableTennisEndpointBlockedError(error)
         && options.sourceFallbackAttempted !== true
-        && isBetsapiDataHostname(parseUrl(url) && parseUrl(url).hostname)
+        && getTableTennisDataSourceId(url)
       ) {
         fetchError = stringifyError(error);
       } else if (isBsportsfanProtectionError(error)) {
@@ -10167,11 +10185,11 @@
     if (options.allowIframe === false) {
       if (
         options.sourceFallbackAttempted !== true
-        && isBetsapiDataHostname(parseUrl(url) && parseUrl(url).hostname)
+        && getTableTennisDataSourceId(url)
       ) {
-        markBetsapiEndpointFallback("player-history");
+        markTableTennisEndpointFallback("player-history", url);
         return fetchPlayerResultMatchesUncached(
-          rebaseTableTennisDataUrl(url, BSPORTSFAN_TABLE_TENNIS_ORIGIN),
+          getAlternateTableTennisDataUrl(url),
           { ...options, sourceFallbackAttempted: true, allowIframe: false }
         );
       }
@@ -10179,11 +10197,11 @@
     }
     if (
       options.sourceFallbackAttempted !== true
-      && isBetsapiDataHostname(parseUrl(url) && parseUrl(url).hostname)
+      && getTableTennisDataSourceId(url)
     ) {
-      markBetsapiEndpointFallback("player-history");
+      markTableTennisEndpointFallback("player-history", url);
       return fetchPlayerResultMatchesUncached(
-        rebaseTableTennisDataUrl(url, BSPORTSFAN_TABLE_TENNIS_ORIGIN),
+        getAlternateTableTennisDataUrl(url),
         { ...options, sourceFallbackAttempted: true, allowIframe: false }
       );
     }
@@ -11635,25 +11653,51 @@
 
   function preferTableTennisEndpointUrl(value, endpointType) {
     const url = normalizeUrl(value || "");
-    if (!url || !isBetsapiDataHostname(parseUrl(url) && parseUrl(url).hostname)) {
+    if (!url) {
       return url;
     }
-    const fallbackUntil = Number(tableTennisEndpointFallbackUntil.get(
-      normalizeText(endpointType || "generic")
-    ) || 0);
+    const key = normalizeText(endpointType || "generic");
+    const override = tableTennisEndpointRouteOverrides.get(key);
+    const fallbackUntil = Number(override && override.until || 0);
     if (fallbackUntil <= Date.now()) {
-      if (fallbackUntil) {
-        tableTennisEndpointFallbackUntil.delete(normalizeText(endpointType || "generic"));
+      if (override) {
+        tableTennisEndpointRouteOverrides.delete(key);
       }
       return url;
     }
-    return rebaseTableTennisDataUrl(url, BSPORTSFAN_TABLE_TENNIS_ORIGIN);
+    const targetOrigin = override && override.targetSourceId === "betsapi"
+      ? BETSAPI_TABLE_TENNIS_ORIGIN
+      : override && override.targetSourceId === "bsportsfan"
+        ? BSPORTSFAN_TABLE_TENNIS_ORIGIN
+        : "";
+    return targetOrigin ? rebaseTableTennisDataUrl(url, targetOrigin) : url;
   }
 
-  function markBetsapiEndpointFallback(endpointType, ttlMs = 20 * 60 * 1000) {
-    tableTennisEndpointFallbackUntil.set(
+  function getAlternateTableTennisDataUrl(value) {
+    const url = normalizeUrl(value || "");
+    const sourceId = getTableTennisDataSourceId(url);
+    if (!url || !sourceId) {
+      return url;
+    }
+    return rebaseTableTennisDataUrl(
+      url,
+      sourceId === "betsapi"
+        ? BSPORTSFAN_TABLE_TENNIS_ORIGIN
+        : BETSAPI_TABLE_TENNIS_ORIGIN
+    );
+  }
+
+  function markTableTennisEndpointFallback(endpointType, failedUrl, ttlMs = 20 * 60 * 1000) {
+    const sourceId = getTableTennisDataSourceId(failedUrl);
+    if (!sourceId) {
+      return;
+    }
+    tableTennisEndpointRouteOverrides.set(
       normalizeText(endpointType || "generic"),
-      Date.now() + Math.max(60 * 1000, Number(ttlMs || 0) || 0)
+      {
+        targetSourceId: sourceId === "betsapi" ? "bsportsfan" : "betsapi",
+        until: Date.now() + Math.max(60 * 1000, Number(ttlMs || 0) || 0)
+      }
     );
   }
 
@@ -11799,28 +11843,6 @@
       }
     });
     return true;
-  }
-
-  function maybeRestorePrimaryTableTennisSource() {
-    if (
-      tableTennisSourceFailoverStarted
-      || !isCipTableTennisMonitorPage()
-      || isBetsapiDataHostname(location.hostname)
-      || inlineAutoForecastActiveWorkers > 0
-      || inlineAutoForecastQueue.size > 0
-      || hasUrgentProductionForecastWork()
-    ) {
-      return;
-    }
-    sendRuntimeMessage({
-      type: "lvr:getTableTennisSourceRoute",
-      url: normalizeUrl(location.href),
-      preferPrimary: true
-    }).then((route) => {
-      if (route && route.targetSourceId === "betsapi" && route.shouldSwitch) {
-        navigateToTableTennisSource(route.targetOrigin, "primary-source-restored");
-      }
-    }).catch(() => {});
   }
 
   function parseInteger(value) {
