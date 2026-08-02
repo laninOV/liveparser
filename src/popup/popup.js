@@ -37,6 +37,7 @@ let archiveDashboardTimer = 0;
 let archiveDashboardLoading = false;
 let archiveStorageListener = null;
 const EXTENSION_RELOAD_PREPARE_TIMEOUT_MS = 1500;
+const TABLE_TENNIS_TAB_URL_PATTERNS = globalThis.LvrTableTennisSources.TAB_URL_PATTERNS;
 
 document.addEventListener("DOMContentLoaded", () => {
   forecastButton.addEventListener("click", collectForecast);
@@ -174,7 +175,6 @@ async function collectFromTab(tab, type) {
         "src/shared/table-tennis-sources.js",
         "src/shared/pipeline-policy.js",
         "src/shared/start-match-rule.js",
-        "src/shared/side-correction-guard.js",
         "src/shared/verified-pair-regime-v1.js",
         "src/content/bsportsfan-parser.js"
       ]
@@ -387,7 +387,7 @@ function formatCurrentCollectorStatus(scanStatus) {
     return `переключаю ${sourceLabel}`;
   }
   if (
-    String(scanStatus && scanStatus.source || "") === "bsportsfan-protection"
+    String(scanStatus && scanStatus.statusKind || "") === "protection"
     || snapshot.challenge === true
   ) {
     return `защита ${sourceLabel} — переключаю источник`;
@@ -413,13 +413,15 @@ function formatCurrentCollectorStatus(scanStatus) {
       ? cipMonitor.forecastStates
       : {};
     const activeWorkers = Math.max(0, Number(cipMonitor.forecastActiveWorkers || 0));
+    const queuedForecasts = Math.max(0, Number(cipMonitor.forecastQueueSize || 0));
+    const activeForecasts = activeWorkers + queuedForecasts;
     const retries = Math.max(0, Number(states.cooling || 0));
     const profileBlocked = Array.isArray(cipMonitor.forecastErrors)
       && cipMonitor.forecastErrors.some((entry) => /HTTP\s*(?:403|429)|profile failure/i.test(String(entry && entry.message || "")));
     if (profileBlocked) {
       return `${sourceLabel} · список работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · история игроков недоступна — пробую резерв`;
     }
-    return `${sourceLabel} · работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · ждут старта ${Number(cipMonitor.waitingRows || 0)} · в работе ${activeWorkers} · повторов ${retries}`;
+    return `${sourceLabel} · работает · видно ${Number(cipMonitor.visibleRows || visibleRows)} · ждут старта ${Number(cipMonitor.waitingRows || 0)} · в работе ${activeForecasts} · повторов ${retries}`;
   }
   return snapshot.ts ? `список матчей не открыт · видно ${visibleRows}` : "нет данных";
 }
@@ -549,10 +551,6 @@ async function backfillArchiveResults() {
       setArchiveActionStatus("Текущий источник недоступен — включается второй. Досбор продолжится автоматически.");
       return;
     }
-    if (status === "bsportsfan-protection-opened") {
-      setArchiveActionStatus("Открыт второй источник результатов. Итоги дособерутся автоматически.");
-      return;
-    }
     if (status === "runtime-unavailable") {
       setArchiveActionStatus("Страница обновилась во время досбора. После загрузки итоги дособерутся автоматически.");
       return;
@@ -576,11 +574,7 @@ async function backfillArchiveResults() {
         ? " Досбор временно приостановлен и будет повторён автоматически."
         : "";
     const message = `Итоги: добавлено ${updated}, уже были ${alreadyUpdated}, проверено ${checked}, ждут завершения ${notReady}, не распознано ${unresolved}, ошибок ${failed}.${stopMessage}`;
-    const recoveryTotal = Math.max(0, Number(summary.recovery && summary.recovery.total || 0));
-    const recoveryMessage = summary.recovery && summary.recovery.started
-      ? ` Открыта очередь старых итогов: ${recoveryTotal} матчей.`
-      : "";
-    setArchiveActionStatus(`${message}${recoveryMessage}`);
+    setArchiveActionStatus(message);
     await loadArchiveDashboard();
     const statsUpdate = updated > 0
       ? await sendRuntimeMessage({
@@ -590,8 +584,8 @@ async function backfillArchiveResults() {
       : null;
     const pinStatus = formatTelegramStatsUpdateStatus(statsUpdate);
     setArchiveActionStatus(pinStatus
-      ? `${message}${recoveryMessage} Закреп: ${pinStatus}.`
-      : `${message}${recoveryMessage}`);
+      ? `${message} Закреп: ${pinStatus}.`
+      : message);
   });
 }
 
@@ -838,12 +832,7 @@ async function sendTelegramTabAction(detail) {
   }
   if (!tab || !tab.id || !isTableTennisSourceUrl(tab.url)) {
     const tabs = await chrome.tabs.query({
-      url: [
-        "https://bsportsfan.com/*",
-        "https://*.bsportsfan.com/*",
-        "https://betsapi.com/*",
-        "https://*.betsapi.com/*"
-      ]
+      url: TABLE_TENNIS_TAB_URL_PATTERNS
     }).catch(() => []);
     tab = (Array.isArray(tabs) ? tabs : [])
       .filter((candidate) => candidate && candidate.id && isTableTennisSourceUrl(candidate.url))
@@ -868,7 +857,6 @@ async function sendTelegramTabAction(detail) {
         "src/shared/table-tennis-sources.js",
         "src/shared/pipeline-policy.js",
         "src/shared/start-match-rule.js",
-        "src/shared/side-correction-guard.js",
         "src/shared/verified-pair-regime-v1.js",
         "src/content/bsportsfan-parser.js"
       ]
@@ -897,7 +885,11 @@ function startProgressPolling() {
     try {
       const payload = await sendRuntimeMessage({ type: "lvr:getScanStatus" });
       const status = payload && payload.scanStatus;
-      if (!status || status.source !== "bsportsfan-progress") {
+      if (
+        !status
+        || status.source !== "table-tennis"
+        || status.statusKind !== "progress"
+      ) {
         return;
       }
 
@@ -1299,90 +1291,6 @@ function hasDatasetFinalResult(row) {
   ));
 }
 
-function countPointSnapshots(rows) {
-  return (Array.isArray(rows) ? rows : []).reduce((total, row) => {
-    const points = Array.isArray(row && row.pointTimeline)
-      ? row.pointTimeline
-      : Array.isArray(row && row.pointByPoint)
-        ? row.pointByPoint
-        : [];
-    return total + points.length;
-  }, 0);
-}
-
-function formatStatsHit(bucket) {
-  const hit = bucket && bucket.hit ? bucket.hit : "0/0";
-  return bucket && bucket.hitRatePct !== "" && bucket.hitRatePct !== undefined
-    ? `${hit} (${bucket.hitRatePct}%)`
-    : hit;
-}
-
-function formatPairCohortStatus(summary) {
-  const safe = summary && typeof summary === "object" ? summary : {};
-  const cohort = Math.max(0, Number(safe.cohortSize || 0));
-  const settled = Math.max(0, Number(safe.baseline && safe.baseline.settled || 0));
-  const invalid = Math.max(0, Number(safe.invalidTaggedRows || 0));
-  const invalidText = invalid ? ` · невалидно ${invalid}` : "";
-  return `в проде · наблюдение ${cohort} · закрыто ${settled}${invalidText}`;
-}
-
-function formatPairCohortBucket(bucket, cohortSize) {
-  const safe = bucket && typeof bucket === "object" ? bucket : {};
-  const selected = Math.max(0, Number(safe.selected || 0));
-  const cohort = Math.max(0, Number(cohortSize || 0));
-  const coverage = safe.coveragePct !== "" && safe.coveragePct !== undefined
-    ? ` (${formatCompactNumber(safe.coveragePct)}%)`
-    : "";
-  return `${formatStatsHit(safe)} · отбор ${selected}/${cohort}${coverage}`;
-}
-
-function formatTelegramDeliveryStatus(value) {
-  if (!value || typeof value !== "object") {
-    return "-";
-  }
-  const reason = String(value.reason || "").trim();
-  const labels = {
-    sent: "отправлено",
-    "sent-partial": "отправлено частично",
-    duplicate: "дубликат",
-    "telegram-disabled": "Telegram выключен",
-    "match-start-trigger-invalid": "не подтверждён старт матча",
-    "match-start-delivery-expired": "первый сет уже закончился",
-    "match-start-state-stale": "снимок старта устарел",
-    "match-start-profile-missing": "не хватает истории/PBP",
-    "match-start-decision-mismatch": "решение не прошло повторную проверку",
-    "match-start-pair-regime-mismatch": "решение PBP-фильтра не прошло повторную проверку",
-    "match-start-action-mismatch": "действие прогноза не совпало",
-    "collapse-combination-qualified": "PBP-фильтр пройден",
-    "collapse-combination-rejected": "PBP-фильтр не пройден",
-    "production-collapse-qualified": "пройдена базовая PBP-комбинация",
-    "production-strength-exception-qualified": "возвращён по PBP Strength",
-    "production-history-share-exception-qualified": "возвращён по стабильности сетов",
-    "production-relative-form-exception-qualified": "возвращён по форме и сетам",
-    "production-market-consensus-salvage-qualified": "возвращён по подтверждению стартовыми кэфами",
-    "production-combination-rejected": "боевой фильтр не пройден",
-    "collapse-profiles-missing": "не хватает профилей игроков",
-    "collapse-selected-side-missing": "не выбрана сторона прогноза",
-    "collapse-common-window-missing": "нет общего PBP-окна",
-    "collapse-metrics-missing": "не хватает PBP для фильтра",
-    "collapse-league-blocked": "лига не разрешена",
-    "production-pbp-filter-missing": "модуль PBP-фильтра не загрузился",
-    "accepted-match-start-production-gate": "прогноз принят боевым фильтром",
-    "tt-cup-shadow-only": "TT Cup сохранён, Telegram выключен",
-    "verified-pair-regimes-rejected": "старый PBP-фильтр не пройден",
-    "verified-pair-profiles-missing": "не хватает профилей игроков",
-    "verified-pair-selected-side-missing": "не выбрана сторона прогноза",
-    "verified-pair-common-window-missing": "нет общего PBP-окна",
-    "verified-pair-metrics-missing": "не хватает PBP для фильтра",
-    "verified-pair-league-blocked": "лига не разрешена",
-    "verified-pair-regime-qualified": "старый PBP-фильтр пройден"
-  };
-  const status = value.sent === true || value.edited === true
-    ? value.edited === true ? "обновлено" : "отправлено"
-    : labels[reason] || reason || "не отправлено";
-  return `${status} · ${formatDateTime(value.ts)}`;
-}
-
 function buildArchiveGamesCsv(rows) {
   const currentProtocol = globalThis.LvrVerifiedPairRegimeV1
     && globalThis.LvrVerifiedPairRegimeV1.PROTOCOL || {};
@@ -1428,23 +1336,6 @@ function buildArchiveGamesCsv(rows) {
     "baseSelectedSideIndex",
     "historySelectedSideIndex",
     "selectedSideIndex",
-    "sideGuardRuleId",
-    "sideGuardHistorySideIndex",
-    "sideGuardBaseSideIndex",
-    "sideGuardSelectedSideIndex",
-    "sideGuardSelectedSource",
-    "sideGuardSidesDisagree",
-    "sideGuardWindowSize",
-    "sideGuardQualifyingSettled",
-    "sideGuardPairOutcomes",
-    "sideGuardPairSum",
-    "sideGuardReason",
-    "sideGuardInputHash",
-    "sideGuardStateCutoffAt",
-    "sideGuardStateThroughSettledAt",
-    "sideGuardStateHash",
-    "sideGuardStateSource",
-    "sideGuardStateSourceCount",
     "finalDecisionAt",
     "historySideCorrectionApplied",
     "historySideCorrectionReason",
@@ -1569,27 +1460,6 @@ function buildArchiveGamesCsv(rows) {
         ?? prematch.sideIndex
         ?? (row && row.sideIndex)
         ?? "",
-      sideGuardRuleId: features.startMatchSideGuardRuleId || "",
-      sideGuardHistorySideIndex: features.startMatchSideGuardHistorySideIndex ?? "",
-      sideGuardBaseSideIndex: features.startMatchSideGuardBaseSideIndex ?? "",
-      sideGuardSelectedSideIndex: features.startMatchSideGuardSelectedSideIndex ?? "",
-      sideGuardSelectedSource: features.startMatchSideGuardSelectedSource || "",
-      sideGuardSidesDisagree: features.startMatchSideGuardSidesDisagree ?? "",
-      sideGuardWindowSize: features.startMatchSideGuardWindowSize ?? "",
-      sideGuardQualifyingSettled: features.startMatchSideGuardQualifyingSettled ?? "",
-      sideGuardPairOutcomes: Array.isArray(features.startMatchSideGuardPairOutcomes)
-        ? JSON.stringify(features.startMatchSideGuardPairOutcomes)
-        : "",
-      sideGuardPairSum: features.startMatchSideGuardPairSum ?? "",
-      sideGuardReason: features.startMatchSideGuardReason || "",
-      sideGuardInputHash: features.startMatchSideGuardInputHash || "",
-      sideGuardStateCutoffAt: formatDateTime(features.startMatchSideGuardStateCutoffAt),
-      sideGuardStateThroughSettledAt: formatDateTime(
-        features.startMatchSideGuardStateThroughSettledAt
-      ),
-      sideGuardStateHash: features.startMatchSideGuardStateHash || "",
-      sideGuardStateSource: features.startMatchSideGuardStateSource || "",
-      sideGuardStateSourceCount: features.startMatchSideGuardStateSourceCount ?? "",
       finalDecisionAt: formatDateTime(prematch.finalDecisionAt),
       historySideCorrectionApplied: features.startMatchSideCorrectionApplied ?? "",
       historySideCorrectionReason: features.startMatchSideCorrectionReason ?? "",

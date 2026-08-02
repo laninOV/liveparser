@@ -37,7 +37,10 @@
     && typeof globalThis.crypto.randomUUID === "function"
     ? globalThis.crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const TABLE_TENNIS_DOCUMENT_STARTED_AT = Date.now();
   const TABLE_TENNIS_COLLECTOR_RETRY_INTERVAL_MS = 10 * 1000;
+  const TABLE_TENNIS_COLLECTOR_FAST_RETRY_MS = 1500;
+  const TABLE_TENNIS_COLLECTOR_CLAIM_TIMEOUT_MS = 6 * 1000;
   const TABLE_TENNIS_HEALTH_REPORT_INTERVAL_MS = 30 * 1000;
   const MUTATION_DELAY_MS = 250;
   const MUTATION_MIN_UPDATE_INTERVAL_MS = 3000;
@@ -60,9 +63,6 @@
   const MATCH_START_RULE_ID = String(
     globalThis.LvrStartMatchRule && globalThis.LvrStartMatchRule.RULE_ID || ""
   );
-  const MATCH_START_SIDE_GUARD_RULE_ID = String(
-    globalThis.LvrSideCorrectionGuard && globalThis.LvrSideCorrectionGuard.RULE_ID || ""
-  );
   const MATCH_START_PAIR_PROTOCOL = globalThis.LvrVerifiedPairRegimeV1
     && globalThis.LvrVerifiedPairRegimeV1.PROTOCOL || {};
   const MATCH_START_PAIR_GATE_ID = String(MATCH_START_PAIR_PROTOCOL.gateId || "");
@@ -75,7 +75,6 @@
   const FRESH_FORM3_WEIGHTS = [0.5, 0.3, 0.2];
   const ARCHIVE_MAX_CANDIDATE_URLS = 60;
   const RESULTS_PATH = "/ce/table-tennis/";
-  const LEGACY_TELEGRAM_RESULT_CRAWLER_STORAGE_KEY = "__lvrTelegramPredictionResultCrawler";
   const TELEGRAM_RESULT_AUTO_BACKFILL_INITIAL_DELAY_MS = 2 * 60 * 1000;
   const TELEGRAM_RESULT_PAGE_AUTO_BACKFILL_DELAY_MS = 5 * 1000;
   const TELEGRAM_RESULT_AUTO_BACKFILL_INTERVAL_MS = 10 * 60 * 1000;
@@ -93,7 +92,6 @@
   const INLINE_FORECAST_ERROR_RETRY_MS = 60 * 1000;
   const INLINE_FORECAST_TRANSIENT_RETRY_MS = 12 * 1000;
   const INLINE_FORECAST_MAX_TRANSIENT_ATTEMPTS = 3;
-  const INLINE_FORECAST_WORKER_LEASE_MS = INLINE_FORECAST_COLLECTION_TIMEOUT_MS + 5000;
   const RUNTIME_SETTINGS_TIMEOUT_MS = 6000;
   const RUNTIME_DELIVERY_TIMEOUT_MS = 22 * 1000;
   const BSPORTSFAN_TEXT_FETCH_TIMEOUT_MS = 15 * 1000;
@@ -159,6 +157,8 @@
   let telegramSettingsRequest = null;
   let telegramResultAutoBackfillRunning = false;
   let telegramResultAutoBackfillLastSummary = null;
+  let telegramResultAutoBackfillGeneration = 0;
+  let telegramResultAutoBackfillContext = null;
   let telegramOpeningOddsBackfillRunning = false;
   let telegramOpeningOddsBackfillLastSummary = null;
   let playerMatchesCacheLoaded = false;
@@ -174,11 +174,17 @@
   let liveSessionRecoveryPreparation = null;
   let visibleChallengeActive = false;
   let visibleHealthyReported = false;
+  let visibleHealthReportInFlight = false;
   let lastVisibleHealthyReportAt = 0;
-  let tableTennisCollectorLeadershipActive = true;
+  let tableTennisCollectorLeadershipActive = false;
   let tableTennisCollectorHeartbeatStarted = false;
+  let tableTennisCollectorHeartbeatInFlight = false;
+  let tableTennisCollectorHeartbeatRetryTimer = 0;
+  let tableTennisCollectorLeadershipGeneration = 0;
+  let tableTennisCollectorLeaseToken = "";
+  let tableTennisCollectorLeaseUntil = 0;
+  let runtimeDeadlineSequence = 0;
   let tableTennisSourceRecoveryProbeStarted = false;
-  let tableTennisSourceFailoverRetryNeeded = false;
   const telegramResultAutoBackfillRetryAt = new Map();
 
   let mutationTimer = 0;
@@ -188,7 +194,6 @@
   let lastStatusReportTs = 0;
 
   whenDocumentReady(async () => {
-    clearLegacyTelegramPredictionResultCrawlerState();
     installProductionBridge();
     installRuntimeListener();
     await hydrateSharedTableTennisParserCaches();
@@ -232,12 +237,16 @@
         return false;
       }
     }
-    const response = await sendRuntimeMessage({
+    if (!isCipTableTennisMonitorPage()) {
+      return true;
+    }
+    const response = await sendRuntimeMessageWithTimeout({
       type: "lvr:reportBsportsfanHealthy",
+      ...getTableTennisCollectorMessageIdentity(),
       observedAt: Date.now(),
       url: normalizeUrl(location.href)
-    }).catch(() => null);
-    visibleHealthyReported = Boolean(response && response.healthy);
+    }, TABLE_TENNIS_COLLECTOR_CLAIM_TIMEOUT_MS).catch(() => null);
+    visibleHealthyReported = Boolean(response && response.accepted === true);
     if (visibleHealthyReported) {
       lastVisibleHealthyReportAt = Date.now();
     }
@@ -264,16 +273,20 @@
       }
       if (isCurrentTableTennisSourcePageHealthy(document)) {
         recoveryStarted = true;
-        sendRuntimeMessage({
+        sendRuntimeMessageWithTimeout({
           type: "lvr:reportBsportsfanHealthy",
+          ...getTableTennisCollectorMessageIdentity(),
           observedAt: Date.now(),
           url: normalizeUrl(location.href)
-        }).finally(() => window.location.reload());
+        }, TABLE_TENNIS_COLLECTOR_CLAIM_TIMEOUT_MS)
+          .then((response) => {
+            if (response && response.accepted === true) {
+              window.location.reload();
+              return;
+            }
+            recoveryStarted = false;
+          });
         return;
-      }
-      if (tableTennisSourceFailoverRetryNeeded && !tableTennisSourceFailoverStarted) {
-        tableTennisSourceFailoverRetryNeeded = false;
-        scheduleTableTennisSourceFailover("source-failover-retry");
       }
     };
     window.setInterval(check, 5000);
@@ -294,12 +307,15 @@
     if (!isCipTableTennisMonitorPage()) {
       return true;
     }
-    const lease = await sendRuntimeMessage({
-      type: "lvr:claimTableTennisCollector",
-      url: normalizeUrl(location.href),
-      allowActiveTabTakeover: true
-    }).catch(() => null);
-    tableTennisCollectorLeadershipActive = !lease || lease.leader !== false;
+    const lease = await claimTableTennisCollector({ allowActiveTabTakeover: true })
+      .catch(() => null);
+    tableTennisCollectorLeadershipActive = Boolean(lease && lease.leader === true);
+    tableTennisCollectorLeaseToken = tableTennisCollectorLeadershipActive
+      ? normalizeText(lease.token || "")
+      : "";
+    tableTennisCollectorLeaseUntil = tableTennisCollectorLeadershipActive
+      ? Math.max(Date.now(), Number(lease.leaseUntil || 0) || 0)
+      : 0;
     installTableTennisCollectorHeartbeat();
     if (tableTennisCollectorLeadershipActive) {
       return true;
@@ -322,13 +338,59 @@
       return;
     }
     tableTennisCollectorHeartbeatStarted = true;
-    window.setInterval(() => {
-      sendRuntimeMessage({
-        type: "lvr:claimTableTennisCollector",
-        url: normalizeUrl(location.href)
-      }).then((lease) => {
+    const scheduleFastRetry = () => {
+      if (tableTennisCollectorHeartbeatRetryTimer) {
+        return;
+      }
+      tableTennisCollectorHeartbeatRetryTimer = window.setTimeout(() => {
+        tableTennisCollectorHeartbeatRetryTimer = 0;
+        renewLeadership().catch(() => {});
+      }, TABLE_TENNIS_COLLECTOR_FAST_RETRY_MS);
+    };
+    const handleIndeterminateClaim = (generation) => {
+      if (generation !== tableTennisCollectorLeadershipGeneration) {
+        return;
+      }
+      const wasLeader = tableTennisCollectorLeadershipActive;
+      if (wasLeader && Date.now() < tableTennisCollectorLeaseUntil) {
+        scheduleFastRetry();
+        return;
+      }
+      tableTennisCollectorLeadershipActive = false;
+      tableTennisCollectorLeaseToken = "";
+      tableTennisCollectorLeaseUntil = 0;
+      if (wasLeader) {
+        stopTableTennisCollectorWork("collector-heartbeat-expired");
+      }
+      scheduleFastRetry();
+    };
+    const renewLeadership = async () => {
+      if (tableTennisCollectorHeartbeatInFlight) {
+        return;
+      }
+      tableTennisCollectorHeartbeatInFlight = true;
+      const generation = tableTennisCollectorLeadershipGeneration;
+      try {
+        const lease = await claimTableTennisCollector({ allowActiveTabTakeover: true });
+        if (generation !== tableTennisCollectorLeadershipGeneration) {
+          return;
+        }
+        if (!lease || typeof lease.leader !== "boolean") {
+          handleIndeterminateClaim(generation);
+          return;
+        }
         const wasLeader = tableTennisCollectorLeadershipActive;
-        tableTennisCollectorLeadershipActive = !lease || lease.leader !== false;
+        tableTennisCollectorLeadershipActive = lease.leader === true;
+        tableTennisCollectorLeaseToken = tableTennisCollectorLeadershipActive
+          ? normalizeText(lease.token || "")
+          : "";
+        tableTennisCollectorLeaseUntil = tableTennisCollectorLeadershipActive
+          ? Math.max(Date.now(), Number(lease.leaseUntil || 0) || 0)
+          : 0;
+        if (tableTennisCollectorHeartbeatRetryTimer) {
+          window.clearTimeout(tableTennisCollectorHeartbeatRetryTimer);
+          tableTennisCollectorHeartbeatRetryTimer = 0;
+        }
         if (tableTennisCollectorLeadershipActive && !wasLeader) {
           window.location.reload();
           return;
@@ -336,27 +398,53 @@
         if (!tableTennisCollectorLeadershipActive && wasLeader) {
           stopTableTennisCollectorWork("collector-leadership-lost");
         }
-      }).catch(() => {});
+      } catch (_) {
+        handleIndeterminateClaim(generation);
+      } finally {
+        tableTennisCollectorHeartbeatInFlight = false;
+      }
+    };
+    window.setInterval(() => {
+      renewLeadership().catch(() => {});
     }, TABLE_TENNIS_COLLECTOR_RETRY_INTERVAL_MS);
+    window.setTimeout(() => {
+      renewLeadership().catch(() => {});
+    }, 1000);
+  }
+
+  function claimTableTennisCollector(options = {}) {
+    return sendRuntimeMessageWithTimeout({
+        type: "lvr:claimTableTennisCollector",
+        url: normalizeUrl(location.href),
+        allowActiveTabTakeover: options.allowActiveTabTakeover === true,
+        documentNonce: TABLE_TENNIS_DOCUMENT_NONCE,
+        documentStartedAt: TABLE_TENNIS_DOCUMENT_STARTED_AT
+      }, TABLE_TENNIS_COLLECTOR_CLAIM_TIMEOUT_MS);
+  }
+
+  function getTableTennisCollectorMessageIdentity() {
+    return {
+      collectorLeaseToken: tableTennisCollectorLeaseToken,
+      documentNonce: TABLE_TENNIS_DOCUMENT_NONCE,
+      documentStartedAt: TABLE_TENNIS_DOCUMENT_STARTED_AT
+    };
   }
 
   function stopTableTennisCollectorWork(reason) {
+    telegramResultAutoBackfillGeneration += 1;
+    if (
+      telegramResultAutoBackfillContext
+      && telegramResultAutoBackfillContext.requireCollector === true
+    ) {
+      telegramResultAutoBackfillContext.cancelled = true;
+      telegramResultAutoBackfillContext.cancelReason = normalizeText(reason || "collector-stopped");
+    }
     inlineAutoForecastQueue.clear();
     for (const job of inlineAutoForecastActiveJobs.values()) {
       if (!job) continue;
       job.preemptRequested = true;
       job.preemptedBy = normalizeText(reason || "collector-stopped");
       job.preemptRequestedAt = Date.now();
-    }
-  }
-
-  function clearLegacyTelegramPredictionResultCrawlerState() {
-    try {
-      if (window.localStorage) {
-        window.localStorage.removeItem(LEGACY_TELEGRAM_RESULT_CRAWLER_STORAGE_KEY);
-      }
-    } catch (_) {
-      // Legacy state is optional and must never block the active parser.
     }
   }
 
@@ -600,6 +688,7 @@
     const recovery = registerLiveSessionRecoveryAttempt();
     liveSessionRecoveryPreparation = sendRuntimeMessage({
       type: "lvr:prepareBsportsfanLiveSessionRecovery",
+      ...getTableTennisCollectorMessageIdentity(),
       detectedAt: recovery.detectedAt,
       attempt: recovery.attempt
     }).catch(() => null);
@@ -616,6 +705,7 @@
     if (recovery.exhausted) {
       sendRuntimeMessage({
         type: "lvr:reportBsportsfanProtection",
+        ...getTableTennisCollectorMessageIdentity(),
         reason: "live-session-manual-recovery-required",
         code: "bsportsfan-session-expired",
         visibleFailure: true,
@@ -656,18 +746,7 @@
     if (!expired) {
       return null;
     }
-    const style = root.style || {};
-    const inlineVisible = style.display !== "none" && style.visibility !== "hidden";
-    if (!inlineVisible) {
-      return null;
-    }
-    if (typeof window.getComputedStyle === "function") {
-      const computed = window.getComputedStyle(root);
-      if (computed && (computed.display === "none" || computed.visibility === "hidden")) {
-        return null;
-      }
-    }
-    return root;
+    return isElementVisiblyRendered(root) ? root : null;
   }
 
   function registerLiveSessionRecoveryAttempt() {
@@ -763,9 +842,14 @@
   }
 
   function reportLiveSessionRecoveryStatus(stage, recovery) {
+    const observedAt = Date.now();
     sendRuntimeMessage({
       type: "lvr:setScanStatus",
       status: {
+        ...getTableTennisCollectorMessageIdentity(),
+        source: "table-tennis",
+        statusKind: "recovery",
+        observedAt,
         message: stage === "reloading"
           ? "bsportsfan live session reload"
           : stage === "manual-required"
@@ -776,7 +860,9 @@
           ? "Live-сессия не восстановилась — нажмите Refresh to Reconnect"
           : "Live-сессия истекла — переподключаюсь"],
         bsportsfan: {
-          source: "bsportsfan",
+          dataSource: getCurrentTableTennisSourceId(),
+          url: normalizeUrl(location.href),
+          ts: observedAt,
           sessionRecovery: {
             active: true,
             stage: normalizeText(stage || ""),
@@ -792,6 +878,7 @@
   function notifyBsportsfanAttention(kind) {
     sendRuntimeMessage({
       type: "lvr:notifyBsportsfanAttention",
+      ...getTableTennisCollectorMessageIdentity(),
       kind: normalizeText(kind || "security-challenge"),
       observedAt: Date.now(),
       url: normalizeUrl(location.href)
@@ -887,8 +974,7 @@
 
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!message || (
-        message.type !== "lvr:collectNow"
-        && message.type !== "lvr:collectPlayerArchive"
+        message.type !== "lvr:collectPlayerArchive"
         && message.type !== "lvr:telegramAction"
         && message.type !== "lvr:tableTennisCollectorLeaseRevoked"
       )) {
@@ -896,7 +982,23 @@
       }
 
       if (message.type === "lvr:tableTennisCollectorLeaseRevoked") {
+        const revokedToken = normalizeText(message.revokedToken || "");
+        if (
+          revokedToken
+          && tableTennisCollectorLeaseToken
+          && revokedToken !== tableTennisCollectorLeaseToken
+        ) {
+          sendResponse({ ok: true, ignored: true });
+          return false;
+        }
+        tableTennisCollectorLeadershipGeneration += 1;
         tableTennisCollectorLeadershipActive = false;
+        tableTennisCollectorLeaseToken = "";
+        tableTennisCollectorLeaseUntil = 0;
+        if (tableTennisCollectorHeartbeatRetryTimer) {
+          window.clearTimeout(tableTennisCollectorHeartbeatRetryTimer);
+          tableTennisCollectorHeartbeatRetryTimer = 0;
+        }
         stopTableTennisCollectorWork("collector-leadership-revoked");
         window.__liveValueRadarBsportsfanCipMonitor = {
           ts: Date.now(),
@@ -926,11 +1028,7 @@
         return true;
       }
 
-      const snapshot = buildBsportsfanSnapshot("manual");
-      window.__liveValueRadarBsportsfanSnapshot = snapshot;
-      reportStatus(snapshot, true);
-      sendResponse({ ok: true, snapshot });
-      return true;
+      return false;
     });
   }
 
@@ -1249,6 +1347,7 @@
         && tableTennisCollectorLeadershipActive;
       if (
         canReportHealth
+        && !visibleHealthReportInFlight
         && (
           visibleChallengeActive
           || !visibleHealthyReported
@@ -1258,18 +1357,31 @@
         if (!isCurrentTableTennisSourcePageHealthy(document)) {
           return false;
         }
-        visibleChallengeActive = false;
-        if (visibleChallengeRetryTimer) {
-          window.clearTimeout(visibleChallengeRetryTimer);
-          visibleChallengeRetryTimer = 0;
-        }
-        visibleHealthyReported = true;
-        lastVisibleHealthyReportAt = now;
-        sendRuntimeMessage({
+        visibleHealthReportInFlight = true;
+        sendRuntimeMessageWithTimeout({
           type: "lvr:reportBsportsfanHealthy",
+          ...getTableTennisCollectorMessageIdentity(),
           observedAt: Date.now(),
           url: normalizeUrl(location.href)
-        }).catch(() => {});
+        }, TABLE_TENNIS_COLLECTOR_CLAIM_TIMEOUT_MS).then((response) => {
+          if (response && response.accepted === true) {
+            visibleChallengeActive = false;
+            if (visibleChallengeRetryTimer) {
+              window.clearTimeout(visibleChallengeRetryTimer);
+              visibleChallengeRetryTimer = 0;
+            }
+            visibleHealthyReported = true;
+            lastVisibleHealthyReportAt = Date.now();
+            return;
+          }
+          visibleHealthyReported = false;
+          lastVisibleHealthyReportAt = 0;
+        }).catch(() => {
+          visibleHealthyReported = false;
+          lastVisibleHealthyReportAt = 0;
+        }).finally(() => {
+          visibleHealthReportInFlight = false;
+        });
       }
       return false;
     }
@@ -1291,11 +1403,17 @@
       sendRuntimeMessage({
         type: "lvr:setScanStatus",
         status: {
-          source: "bsportsfan-protection",
+          ...getTableTennisCollectorMessageIdentity(),
+          source: "table-tennis",
+          statusKind: "protection",
+          observedAt: now,
           message: "BSportsFan просит пройти проверку",
           candidates: 0,
           sample: ["Запросы остановлены; расширение повторит подключение через 30 минут"],
           bsportsfan: {
+            dataSource: getCurrentTableTennisSourceId(),
+            url: normalizeUrl(location.href),
+            ts: now,
             challenge: true,
             observedAt: now,
             autoRetryAt: now + BSPORTSFAN_VISIBLE_CHALLENGE_RETRY_MS
@@ -3504,6 +3622,10 @@
     };
 
     for (const row of candidates) {
+      if (typeof config.shouldContinue === "function" && !config.shouldContinue()) {
+        summary.stopped = "collector-changed";
+        break;
+      }
       if (liveSessionRecoveryStarted) {
         summary.stopped = "live-session-recovery";
         break;
@@ -3522,11 +3644,19 @@
       if (delayMs && summary.checked > 0) {
         await sleep(delayMs);
       }
+      if (typeof config.shouldContinue === "function" && !config.shouldContinue()) {
+        summary.stopped = "collector-changed";
+        break;
+      }
       try {
         const found = storedResult
           || await fetchTelegramPredictionFinalResult(row, {
             requestPriority: config.requestPriority
           });
+        if (typeof config.shouldContinue === "function" && !config.shouldContinue()) {
+          summary.stopped = "collector-changed";
+          break;
+        }
         summary.checked += 1;
         if (storedResult) {
           summary.reusedStored += 1;
@@ -3540,11 +3670,21 @@
           });
           continue;
         }
-        const response = await sendRuntimeMessage(buildTelegramPredictionResultUpdateMessage(
+        const updateMessage = buildTelegramPredictionResultUpdateMessage(
           matchUrl,
           found,
           found.source || "result-backfill"
-        ));
+        );
+        if (config.requireCollector === true) {
+          Object.assign(updateMessage, config.collectorIdentity || {}, {
+            requireCollector: true
+          });
+        }
+        const response = await sendRuntimeMessage(updateMessage);
+        if (normalizeText(response && response.reason || "") === "stale-result-collector") {
+          summary.stopped = "collector-changed";
+          break;
+        }
         const recorded = response && response.datasetRecorded !== false;
         const changed = response && response.datasetChanged === true;
         const resolved = response && response.datasetResolved === true;
@@ -3646,16 +3786,22 @@
     }
     if (
       !config.force
+      && (!isCipTableTennisMonitorPage() || !tableTennisCollectorLeadershipActive)
+    ) {
+      return { running: false, status: "passive-tab" };
+    }
+    if (
+      !config.force
       && hasUrgentProductionForecastWork()
     ) {
       return { running: false, status: "forecast-priority" };
     }
     const lease = await sendRuntimeMessage({
       type: "lvr:acquireBsportsfanResultBackfillLease",
+      ...getTableTennisCollectorMessageIdentity(),
+      requireCollector: config.force !== true,
       replaceOwnerLease: config.force === true,
-      leaseMs: config.force
-        ? 2 * 60 * 1000
-        : 45 * 1000
+      leaseMs: 8 * 60 * 1000
     }).catch(() => ({ granted: false }));
     if (!lease || lease.granted !== true) {
       return {
@@ -3665,11 +3811,36 @@
       };
     }
     const maintenanceLeaseToken = normalizeText(lease.token || "");
+    const runContext = {
+      generation: telegramResultAutoBackfillGeneration,
+      requireCollector: config.force !== true,
+      cancelled: false,
+      cancelReason: ""
+    };
+    const shouldContinue = () => Boolean(
+      !runContext.cancelled
+      && runContext.generation === telegramResultAutoBackfillGeneration
+      && (
+        runContext.requireCollector !== true
+        || tableTennisCollectorLeadershipActive
+      )
+    );
 
     telegramResultAutoBackfillRunning = true;
+    telegramResultAutoBackfillContext = runContext;
     const startedAt = Date.now();
     try {
       const initialResponse = await sendRuntimeMessage({ type: "lvr:getTelegramPredictionDataset" });
+      if (!shouldContinue()) {
+        return {
+          running: false,
+          status: "collector-changed",
+          stopped: runContext.cancelReason || "collector-changed",
+          reason,
+          startedAt,
+          completedAt: Date.now()
+        };
+      }
       let dataset = initialResponse && Array.isArray(initialResponse.dataset)
         ? initialResponse.dataset
         : [];
@@ -3678,7 +3849,10 @@
         visibleSync = await syncVisibleTelegramPredictionResults({
           limit: 400,
           verbose: false,
-          dataset
+          dataset,
+          shouldContinue,
+          requireCollector: runContext.requireCollector,
+          collectorIdentity: getTableTennisCollectorMessageIdentity()
         }).catch((error) => ({
           failed: 1,
           error: stringifyError(error)
@@ -3689,12 +3863,26 @@
           verbose: false,
           dataset,
           requestPriority: config.force ? "interactive" : "background",
-          allowFetchFallback: config.force === true
+          allowFetchFallback: true,
+          shouldContinue,
+          requireCollector: runContext.requireCollector,
+          collectorIdentity: getTableTennisCollectorMessageIdentity()
         }).catch((error) => ({
           failed: 1,
           error: stringifyError(error),
           errorCode: normalizeText(error && error.code || "")
         }));
+      }
+      if (!shouldContinue()) {
+        return {
+          running: false,
+          status: "collector-changed",
+          stopped: runContext.cancelReason || "collector-changed",
+          reason,
+          startedAt,
+          completedAt: Date.now(),
+          visibleSync
+        };
       }
       if (
         visibleSync
@@ -3703,14 +3891,11 @@
       ) {
         const errorCode = normalizeText(visibleSync.errorCode || "");
         const liveSessionExpired = errorCode === "bsportsfan-session-expired";
-        const recoveryTab = null;
         telegramResultAutoBackfillLastSummary = {
           running: false,
           status: liveSessionExpired
             ? "live-session-recovery"
-            : recoveryTab && recoveryTab.opened
-              ? "bsportsfan-protection-opened"
-              : "bsportsfan-protection",
+            : "bsportsfan-protection",
           stopped: liveSessionExpired
             ? "live-session-recovery"
             : "bsportsfan-protection",
@@ -3718,7 +3903,6 @@
           startedAt,
           completedAt: Date.now(),
           visibleSync,
-          recoveryTab,
           candidates: 0,
           checked: 0,
           updated: 0,
@@ -3782,7 +3966,10 @@
               delayMs: 0,
               verbose: false,
               preemptForForecasts: false,
-              requestPriority: "background"
+              requestPriority: "background",
+              shouldContinue,
+              requireCollector: runContext.requireCollector,
+              collectorIdentity: getTableTennisCollectorMessageIdentity()
             })
           : {
               checked: 0,
@@ -3793,7 +3980,6 @@
               failed: 0,
               rows: []
             };
-        const recovery = null;
         telegramResultAutoBackfillLastSummary = {
           running: false,
           status: "done",
@@ -3809,8 +3995,7 @@
           notFinishedOrNotParsed: Number(storedSummary.notFinishedOrNotParsed || 0),
           failed: Number(storedSummary.failed || 0),
           skipped: Math.max(0, dataset.length - eligibleCandidates.length),
-          rows: Array.isArray(storedSummary.rows) ? storedSummary.rows : [],
-          recovery
+          rows: Array.isArray(storedSummary.rows) ? storedSummary.rows : []
         };
         return telegramResultAutoBackfillLastSummary;
       }
@@ -3845,7 +4030,10 @@
         delayMs: Math.max(0, Number(config.delayMs || 200) || 0),
         verbose: false,
         preemptForForecasts: config.force !== true,
-        requestPriority: config.force ? "interactive" : "background"
+        requestPriority: config.force ? "interactive" : "background",
+        shouldContinue,
+        requireCollector: runContext.requireCollector,
+        collectorIdentity: getTableTennisCollectorMessageIdentity()
       });
       updateTelegramPredictionResultAutoBackfillRetry(summary);
       telegramResultAutoBackfillLastSummary = {
@@ -3863,6 +4051,9 @@
       return telegramResultAutoBackfillLastSummary;
     } finally {
       telegramResultAutoBackfillRunning = false;
+      if (telegramResultAutoBackfillContext === runContext) {
+        telegramResultAutoBackfillContext = null;
+      }
       if (maintenanceLeaseToken) {
         await sendRuntimeMessage({
           type: "lvr:releaseBsportsfanResultBackfillLease",
@@ -4179,13 +4370,6 @@
     });
   }
 
-  function openBsportsfanResultsRecoveryTab() {
-    return sendRuntimeMessage({
-      type: "lvr:openBsportsfanResultsRecovery",
-      url: normalizeUrl(RESULTS_PATH, location.origin)
-    });
-  }
-
   function loadTelegramPredictionResultsPageInFrame(resultsUrl, options = {}) {
     return new Promise((resolve, reject) => {
       const frame = document.createElement("iframe");
@@ -4283,7 +4467,10 @@
         pollTimer = window.setTimeout(poll, 250);
       }, { once: true });
       frame.style.cssText = "position:fixed;width:1280px;height:900px;left:-2000px;top:0;border:0;opacity:0;pointer-events:none;";
-      acquireBsportsfanRequestSlot(resultsUrl, options).then((lease) => {
+      acquireBsportsfanRequestSlot(resultsUrl, {
+        ...options,
+        deadlineAt: startedAt + timeoutMs
+      }).then((lease) => {
         const token = normalizeText(lease && lease.token || "");
         if (settled) {
           releaseBsportsfanRequestSlot(token);
@@ -4331,6 +4518,10 @@
     };
 
     for (const row of rows) {
+      if (typeof config.shouldContinue === "function" && !config.shouldContinue()) {
+        summary.stopped = "collector-changed";
+        break;
+      }
       const matchUrl = normalizeUrl(findMatchUrlInRow(row));
       if (!matchUrl) {
         continue;
@@ -4370,7 +4561,7 @@
       })).filter((score) => Number.isFinite(score.left) && Number.isFinite(score.right));
       summary.checked += 1;
       try {
-        const response = await sendRuntimeMessage({
+        const updateMessage = {
           type: "lvr:updateTelegramPredictionResult",
           result: {
             matchUrl,
@@ -4380,7 +4571,21 @@
             setScores,
             source
           }
-        });
+        };
+        if (config.requireCollector === true) {
+          Object.assign(updateMessage, config.collectorIdentity || {}, {
+            requireCollector: true
+          });
+        }
+        if (typeof config.shouldContinue === "function" && !config.shouldContinue()) {
+          summary.stopped = "collector-changed";
+          break;
+        }
+        const response = await sendRuntimeMessage(updateMessage);
+        if (normalizeText(response && response.reason || "") === "stale-result-collector") {
+          summary.stopped = "collector-changed";
+          break;
+        }
         const recorded = response && response.datasetRecorded !== false;
         const changed = response && response.datasetChanged === true;
         const resolved = response && response.datasetResolved === true;
@@ -4463,12 +4668,6 @@
   function isForecastResultBackfillCandidate(row) {
     return getPredictionDatasetRecordKind(row) === "forecasted"
       && needsTelegramPredictionResultBackfill(row);
-  }
-
-  function isPublishedForecastResultBackfillCandidate(row) {
-    const prematch = getPredictionDatasetPrematch(row);
-    return isForecastResultBackfillCandidate(row)
-      && Boolean(prematch && (prematch.sent === true || prematch.sent === 1));
   }
 
   function isTelegramPredictionResultResolved(row) {
@@ -4669,7 +4868,7 @@
 
   function parseTelegramPredictionFinalResultDocument(doc, matchUrl, row, source) {
     const snapshot = buildBsportsfanSnapshotFromDocument(doc, matchUrl, "telegram-result-backfill");
-    if (isBsportsfanChallengeSnapshot(snapshot) || isBsportsfanDocumentChallenge(doc)) {
+    if (isBsportsfanDocumentChallenge(doc)) {
       throw createBsportsfanChallengeError(
         "BsportsFan result page returned a security challenge",
         matchUrl
@@ -4806,7 +5005,7 @@
       }, { once: true });
       frame.style.cssText = "position:fixed;width:1280px;height:900px;left:-2000px;top:0;border:0;opacity:0;pointer-events:none;";
       acquireBsportsfanRequestSlot(matchUrl, {
-        deadlineAt: options.deadlineAt,
+        deadlineAt: startedAt + timeoutMs,
         requestPriority: options.requestPriority || "background"
       }).then((lease) => {
         const token = normalizeText(lease && lease.token || "");
@@ -5336,7 +5535,6 @@
         matchUrl
       );
     if (!finalScore) {
-      scheduleUnresolvedResultRecoveryAdvance(matchUrl);
       return false;
     }
 
@@ -5372,36 +5570,14 @@
       }
     }).then((response) => {
       recordTelegramSendDebug("visible-match-result", matchUrl, response);
-      if (response && response.datasetRecorded === true && response.datasetResolved === true) {
-        return sendRuntimeMessage({
-          type: "lvr:advanceBsportsfanResultRecovery",
-          matchUrl: normalizeMatchUrlKey(matchUrl)
-        }).catch(() => null);
+      if (!response || response.datasetRecorded !== true || response.datasetResolved !== true) {
+        telegramResultUpdateState.delete(key);
       }
-      telegramResultUpdateState.delete(key);
-      scheduleUnresolvedResultRecoveryAdvance(matchUrl);
-      return null;
     }).catch((error) => {
       telegramResultUpdateState.delete(key);
       recordTelegramSendDebug("visible-match-result", matchUrl, null, error);
-      scheduleUnresolvedResultRecoveryAdvance(matchUrl);
     });
     return true;
-  }
-
-  function scheduleUnresolvedResultRecoveryAdvance(matchUrl) {
-    const url = normalizeMatchUrlKey(matchUrl);
-    const key = `result-recovery-fallback:${url}`;
-    if (!url || telegramResultUpdateState.has(key)) {
-      return;
-    }
-    addBoundedSetValue(telegramResultUpdateState, key, RUNTIME_STATE_MAX_ENTRIES);
-    window.setTimeout(() => {
-      sendRuntimeMessage({
-        type: "lvr:advanceBsportsfanResultRecovery",
-        matchUrl: url
-      }).catch(() => null);
-    }, 12 * 1000);
   }
 
   function buildMatchPageStartForecastRoute(snapshot) {
@@ -6407,6 +6583,7 @@
         Math.max(100, collectionDeadlineAt - Date.now()),
         "match profile collection"
       );
+      throwIfInlineForecastShouldYield(options, "before-finalize");
       finalizeInlineForecastDeliveryState(matchUrl, archive, matchSnapshot);
       if (!isInlineForecastRunCurrent(matchUrl, runId)) {
         return;
@@ -6417,6 +6594,7 @@
         runId,
         updatedAt: Date.now()
       });
+      throwIfInlineForecastShouldYield(options, "before-side-effects");
       runInlineForecastSideEffects(matchUrl, archive, options);
     } catch (error) {
       if (!isInlineForecastRunCurrent(matchUrl, runId)) {
@@ -6531,12 +6709,16 @@
   function throwIfInlineForecastShouldYield(options = {}, phase = "collection") {
     const liveSessionExpired = liveSessionRecoveryStarted;
     const requestedYield = typeof options.shouldYield === "function" && options.shouldYield();
-    if (!liveSessionExpired && !requestedYield) {
+    const collectorLost = isCipTableTennisMonitorPage()
+      && !tableTennisCollectorLeadershipActive;
+    if (!liveSessionExpired && !requestedYield && !collectorLost) {
       return;
     }
     const error = new Error(liveSessionExpired
       ? `live session expired during ${phase}`
-      : `forecast collection yielded at ${phase}`);
+      : collectorLost
+        ? `collector leadership lost during ${phase}`
+        : `forecast collection yielded at ${phase}`);
     error.code = liveSessionExpired
       ? "bsportsfan-session-expired"
       : "lvr-forecast-preempted";
@@ -6954,10 +7136,12 @@
     }
     const forecastLease = await sendRuntimeMessage({
       type: "lvr:acquireBsportsfanForecastLease",
+      ...getTableTennisCollectorMessageIdentity(),
+      requireCollector: isCipTableTennisMonitorPage(),
       matchUrl,
       documentNonce: TABLE_TENNIS_DOCUMENT_NONCE,
       leaseMs: getInlineForecastWorkerLeaseMs(options)
-    }).catch(() => ({ granted: true, token: "" }));
+    }).catch(() => ({ granted: false, reason: "forecast-lease-unavailable" }));
     if (!forecastLease || forecastLease.granted !== true) {
       return;
     }
@@ -7371,6 +7555,9 @@
   }
 
   function maybeSendInlineTelegramPrediction(matchUrl, archive) {
+    if (isCipTableTennisMonitorPage() && !tableTennisCollectorLeadershipActive) {
+      return Promise.resolve({ sent: false, reason: "collector-leadership-lost" });
+    }
     if (isForecastSuppressedOnCurrentPage()) {
       recordTelegramSendDebug("prematch", normalizeUrl(matchUrl), {
         ok: true,
@@ -7406,6 +7593,8 @@
     }
     return sendRuntimeMessage({
       type: "lvr:sendTelegramPrediction",
+      ...getTableTennisCollectorMessageIdentity(),
+      requireCollector: isCipTableTennisMonitorPage(),
       prediction
     }).then((response) => {
       recordTelegramSendDebug("prematch", normalizeUrl(matchUrl), response);
@@ -8071,36 +8260,6 @@
           modelInput: true
         }
       : null;
-    const sideGuardState = context && context.sideGuardState && typeof context.sideGuardState === "object"
-      ? context.sideGuardState
-      : {};
-    const sideGuardEvaluator = globalThis.LvrSideCorrectionGuard
-      && globalThis.LvrSideCorrectionGuard.evaluate;
-    const sideGuard = typeof sideGuardEvaluator === "function"
-      ? sideGuardEvaluator({
-          historySideIndex: historySelectedSideIndex,
-          baseSideIndex: evaluation.baseSideIndex,
-          pairedOutcomes: sideGuardState.pairedOutcomes,
-          stateHash: sideGuardState.stateHash
-        })
-      : {
-          ruleId: MATCH_START_SIDE_GUARD_RULE_ID,
-          eligible: false,
-          reason: "side-guard-missing",
-          historySideIndex: historySelectedSideIndex,
-          baseSideIndex: evaluation.baseSideIndex === 0 || evaluation.baseSideIndex === 1
-            ? evaluation.baseSideIndex
-            : null,
-          sidesDisagree: false,
-          pairedOutcomes: [],
-          qualifyingSettled: 0,
-          pairSum: 0,
-          windowSize: 3,
-          selectedSource: "history-pbp",
-          selectedSideIndex: historySelectedSideIndex,
-          stateHash: "",
-          inputHash: ""
-        };
     const pairRegimeEvaluator = globalThis.LvrVerifiedPairRegimeV1
       && globalThis.LvrVerifiedPairRegimeV1.evaluate;
     const pairRegime = typeof pairRegimeEvaluator === "function"
@@ -8173,8 +8332,6 @@
       profiles,
       evaluation,
       historySelectedSideIndex,
-      sideGuardState,
-      sideGuard,
       finalDecisionAt,
       frozenMoneylineMarket,
       referenceMoneylineMarket,
@@ -8197,8 +8354,6 @@
       profiles,
       evaluation,
       historySelectedSideIndex,
-      sideGuardState,
-      sideGuard,
       finalDecisionAt,
       frozenMoneylineMarket,
       referenceMoneylineMarket,
@@ -8249,27 +8404,6 @@
       startMatchBaseSelectedSideIndex: evaluation.baseSideIndex === 0 || evaluation.baseSideIndex === 1
         ? evaluation.baseSideIndex
         : "",
-      startMatchSideGuardRuleId: sideGuard.ruleId || MATCH_START_SIDE_GUARD_RULE_ID,
-      startMatchSideGuardHistorySideIndex: sideGuard.historySideIndex ?? "",
-      startMatchSideGuardBaseSideIndex: sideGuard.baseSideIndex ?? "",
-      startMatchSideGuardSelectedSideIndex: sideGuard.selectedSideIndex ?? "",
-      startMatchSideGuardSidesDisagree: sideGuard.sidesDisagree ? 1 : 0,
-      startMatchSideGuardWindowSize: finiteNumberOrNull(sideGuard.windowSize) ?? "",
-      startMatchSideGuardQualifyingSettled: finiteNumberOrNull(sideGuard.qualifyingSettled) ?? "",
-      startMatchSideGuardPairSum: finiteNumberOrNull(sideGuard.pairSum) ?? "",
-      startMatchSideGuardSelectedSource: sideGuard.selectedSource || "",
-      startMatchSideGuardReason: sideGuard.reason || "",
-      startMatchSideGuardInputHash: sideGuard.inputHash || "",
-      startMatchSideGuardPairOutcomes: Array.isArray(sideGuard.pairedOutcomes)
-        ? sideGuard.pairedOutcomes.slice(-3)
-        : [],
-      startMatchSideGuardStateCutoffAt: finiteNumberOrNull(sideGuardState.stateCutoffAt) ?? "",
-      startMatchSideGuardStateThroughSettledAt: finiteNumberOrNull(
-        sideGuardState.stateThroughSettledAt
-      ) ?? "",
-      startMatchSideGuardStateHash: sideGuardState.stateHash || "",
-      startMatchSideGuardStateSource: sideGuardState.source || "",
-      startMatchSideGuardStateSourceCount: finiteNumberOrNull(sideGuardState.sourceCount) ?? "",
       startMatchSideCorrectionApplied: evaluation.sideCorrection && evaluation.sideCorrection.applied ? 1 : 0,
       startMatchSideCorrectionReason: evaluation.sideCorrection && evaluation.sideCorrection.reason || "",
       startMatchRelativeAgreementScore: finiteNumberOrNull(
@@ -9138,12 +9272,15 @@
         continue;
       }
       prematchPointFetchActive += 1;
+      const taskPromise = Promise.resolve().then(job.task);
       raceWithRuntimeDeadline(
-        Promise.resolve().then(job.task),
+        taskPromise,
         Math.min(PREMATCH_POINT_FETCH_TIMEOUT_MS, remainingMs),
         "historical point fetch"
       )
-        .then(job.resolve, job.reject)
+        .then(job.resolve, job.reject);
+      taskPromise
+        .catch(() => {})
         .finally(() => {
           prematchPointFetchActive = Math.max(0, prematchPointFetchActive - 1);
           drainPrematchPointFetchQueue();
@@ -9566,7 +9703,7 @@
       });
       const doc = parseHtmlDocument(html);
       const snapshot = buildBsportsfanSnapshotFromDocument(doc, url, "archive-fetch-fallback");
-      if (isBsportsfanChallengeSnapshot(snapshot)) {
+      if (isBsportsfanDocumentChallenge(doc)) {
         fetchTextCache.delete(normalizeUrl(url));
         throw createBsportsfanChallengeError(describeMissingPlayers(snapshot), url);
       }
@@ -9641,7 +9778,7 @@
       });
       const doc = parseHtmlDocument(html);
       const snapshot = buildBsportsfanSeedSnapshotFromDocument(doc, url, "page-fetch-fallback");
-      if (isBsportsfanChallengeSnapshot(snapshot)) {
+      if (isBsportsfanDocumentChallenge(doc)) {
         fetchTextCache.delete(normalizeUrl(url));
         throw createBsportsfanChallengeError(describeMissingPlayers(snapshot), url);
       }
@@ -9946,7 +10083,7 @@
       }, { once: true });
       frame.style.cssText = "position:fixed;width:1280px;height:900px;left:-2000px;top:0;border:0;opacity:0;pointer-events:none;";
       acquireBsportsfanRequestSlot(oddsUrl, {
-        deadlineAt: context.deadlineAt,
+        deadlineAt: startedAt + timeoutMs,
         requestPriority: context.requestPriority
       }).then((lease) => {
         const token = normalizeText(lease && lease.token || "");
@@ -10213,11 +10350,7 @@
       if (matches.length) {
         return matches;
       }
-      const challengeSnapshot = {
-        title: normalizeText(doc.title || ""),
-        textSample: normalizeText(doc.body && doc.body.textContent || "").slice(0, 500)
-      };
-      if (isBsportsfanChallengeSnapshot(challengeSnapshot)) {
+      if (isBsportsfanDocumentChallenge(doc)) {
         throw createBsportsfanChallengeError(
           "BsportsFan player page returned a security challenge",
           url
@@ -10358,7 +10491,10 @@
         pollTimer = window.setTimeout(poll, 250);
       }, { once: true });
       frame.style.cssText = "position:fixed;width:1280px;height:900px;left:-2000px;top:0;border:0;opacity:0;pointer-events:none;";
-      acquireBsportsfanRequestSlot(url, options).then((lease) => {
+      acquireBsportsfanRequestSlot(url, {
+        ...options,
+        deadlineAt: startedAt + timeoutMs
+      }).then((lease) => {
         const token = normalizeText(lease && lease.token || "");
         if (settled) {
           releaseBsportsfanRequestSlot(token);
@@ -10427,7 +10563,7 @@
           }
           wakeLazyChartsInFrame(doc, win);
           const snapshot = buildBsportsfanSnapshotFromDocument(doc, url, "archive-frame");
-          if (isBsportsfanChallengeSnapshot(snapshot) || isBsportsfanDocumentChallenge(doc)) {
+          if (isBsportsfanDocumentChallenge(doc)) {
             finish(createBsportsfanChallengeError(
               "BsportsFan match iframe returned a security challenge",
               url
@@ -10460,7 +10596,10 @@
         pollTimer = window.setTimeout(poll, 250);
       }, { once: true });
       frame.style.cssText = "position:fixed;width:1280px;height:900px;left:-2000px;top:0;border:0;opacity:0;pointer-events:none;";
-      acquireBsportsfanRequestSlot(url, options).then((lease) => {
+      acquireBsportsfanRequestSlot(url, {
+        ...options,
+        deadlineAt: startedAt + timeoutMs
+      }).then((lease) => {
         const token = normalizeText(lease && lease.token || "");
         if (settled) {
           releaseBsportsfanRequestSlot(token);
@@ -10529,7 +10668,7 @@
           }
           wakePageInFrame(doc, win);
           const snapshot = buildBsportsfanSeedSnapshotFromDocument(doc, url, "page-frame");
-          if (isBsportsfanChallengeSnapshot(snapshot) || isBsportsfanDocumentChallenge(doc)) {
+          if (isBsportsfanDocumentChallenge(doc)) {
             finish(createBsportsfanChallengeError(
               "BsportsFan match page iframe returned a security challenge",
               url
@@ -10559,7 +10698,10 @@
         pollTimer = window.setTimeout(poll, 250);
       }, { once: true });
       frame.style.cssText = "position:fixed;width:1280px;height:900px;left:-2000px;top:0;border:0;opacity:0;pointer-events:none;";
-      acquireBsportsfanRequestSlot(url, options).then((lease) => {
+      acquireBsportsfanRequestSlot(url, {
+        ...options,
+        deadlineAt: startedAt + timeoutMs
+      }).then((lease) => {
         const token = normalizeText(lease && lease.token || "");
         if (settled) {
           releaseBsportsfanRequestSlot(token);
@@ -10829,28 +10971,112 @@
       || sample.includes("turnstile");
   }
 
+  function isElementVisiblyRendered(element) {
+    if (!element || element.getAttribute && element.getAttribute("aria-hidden") === "true") {
+      return false;
+    }
+    for (let node = element; node && node.nodeType === 1; node = node.parentElement) {
+      if (node.hidden || node.getAttribute && node.getAttribute("aria-hidden") === "true") {
+        return false;
+      }
+      const style = node.style || {};
+      if (
+        style.display === "none"
+        || style.visibility === "hidden"
+        || String(style.opacity || "") === "0"
+      ) {
+        return false;
+      }
+      const className = normalizeText(node.className || "");
+      if (/\b(?:d-none|hidden|invisible)\b/i.test(className)) {
+        return false;
+      }
+      const view = node.ownerDocument && node.ownerDocument.defaultView;
+      if (view && typeof view.getComputedStyle === "function") {
+        const computed = view.getComputedStyle(node);
+        if (
+          computed
+          && (
+            computed.display === "none"
+            || computed.visibility === "hidden"
+            || computed.visibility === "collapse"
+            || computed.opacity === "0"
+          )
+        ) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  function hasRecognizableTableTennisContent(doc) {
+    if (!doc || typeof doc.querySelectorAll !== "function") {
+      return false;
+    }
+    const matchLinks = doc.querySelectorAll(BSF_MATCH_LINK_SELECTOR);
+    const playerLinks = doc.querySelectorAll(BSF_PLAYER_LINK_SELECTOR);
+    return matchLinks.length > 0 && playerLinks.length >= 2;
+  }
+
+  function getVisibleBsportsfanChallengeRoot(doc) {
+    if (!doc || typeof doc.querySelectorAll !== "function") {
+      return null;
+    }
+    const selectors = [
+      "#challenge-running",
+      "#challenge-stage",
+      "#challenge-form",
+      "#cf-wrapper",
+      ".cf-turnstile",
+      "iframe[src*='challenges.cloudflare.com']",
+      "iframe[src*='turnstile']",
+      "form[action*='challenge']"
+    ];
+    return Array.from(doc.querySelectorAll(selectors.join(",")))
+      .find(isElementVisiblyRendered) || null;
+  }
+
   function isBsportsfanDocumentChallenge(doc) {
-    return isBsportsfanChallengeSnapshot({
+    if (!doc) {
+      return false;
+    }
+    const snapshot = {
       title: normalizeText(doc && doc.title || ""),
-      textSample: normalizeText(doc && doc.body && doc.body.textContent || "").slice(0, 12000)
-    });
+      textSample: (
+        normalizeText(doc && doc.body && doc.body.innerText || "")
+        || normalizeText(doc && doc.body && doc.body.textContent || "")
+      ).slice(0, 12000)
+    };
+    const visibleRoot = getVisibleBsportsfanChallengeRoot(doc);
+    const recognizableContent = hasRecognizableTableTennisContent(doc);
+    if (visibleRoot && !recognizableContent) {
+      return true;
+    }
+    if (!isBsportsfanChallengeSnapshot(snapshot)) {
+      return false;
+    }
+    if (visibleRoot) {
+      return true;
+    }
+    if (recognizableContent) {
+      return false;
+    }
+    const title = normalizeSearchText(snapshot.title || "");
+    const sample = normalizeSearchText(snapshot.textSample || "");
+    return title.includes("один момент")
+      || title.includes("one moment")
+      || title.includes("just a moment")
+      || sample.includes("один момент")
+      || sample.includes("one moment")
+      || sample.includes("checking your browser")
+      || sample.includes("just a moment")
+      || sample.includes("verify you are human")
+      || sample.includes("enable javascript and cookies");
   }
 
   function isBsportsfanDocumentLiveSessionExpired(doc) {
-    const toast = doc && typeof doc.querySelector === "function"
-      ? doc.querySelector("#authToast.show,#authToast.showing")
-      : null;
-    if (!toast || toast.getAttribute("aria-hidden") === "true") {
-      return false;
-    }
-    const text = normalizeSearchText(toast.textContent || "");
-    return Boolean(
-      (
-        text.includes("security alert")
-        && text.includes("live session has expired")
-      )
-      || text.includes("refresh to reconnect")
-    );
+    return Boolean(getExpiredLiveSessionToast(doc));
   }
 
   function createBsportsfanLiveSessionExpiredError(message, sourceUrl = location.href) {
@@ -11382,10 +11608,14 @@
       return;
     }
     lastStatusReportTs = Date.now();
+    const observedAt = Date.now();
     sendRuntimeMessage({
       type: "lvr:setScanStatus",
       status: {
+        ...getTableTennisCollectorMessageIdentity(),
         source: "table-tennis",
+        statusKind: "snapshot",
+        observedAt,
         message: "bsportsfan parsed",
         candidates: snapshot.matches.length || (snapshot.players.length >= 2 ? 1 : 0),
         sample: [
@@ -11449,10 +11679,20 @@
     });
   }
 
-  function hasRuntimeMessaging() {
-    return typeof chrome !== "undefined"
-      && chrome.runtime
-      && typeof chrome.runtime.sendMessage === "function";
+  function sendRuntimeMessageWithTimeout(message, timeoutMs = 6000) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        window.clearTimeout(timer);
+        resolve(value && typeof value === "object" ? value : null);
+      };
+      const timer = window.setTimeout(() => finish(null), Math.max(100, Number(timeoutMs) || 6000));
+      sendRuntimeMessage(message).then(finish, () => finish(null));
+    });
   }
 
   function createDeadlineError(label = "operation", delayMs = 0) {
@@ -11516,7 +11756,20 @@
   function scheduleRuntimeDeadline(delayMs, onElapsed) {
     let active = true;
     const timeoutMs = Math.max(100, Number(delayMs || 0) || 0);
+    const deadlineId = `${TABLE_TENNIS_DOCUMENT_NONCE}:${++runtimeDeadlineSequence}`;
     let elapsed = false;
+    let remoteCancelled = false;
+    let localTimer = 0;
+    const cancelRemote = () => {
+      if (remoteCancelled) {
+        return;
+      }
+      remoteCancelled = true;
+      sendRuntimeMessage({
+        type: "lvr:cancelRuntimeDeadline",
+        deadlineId
+      }).catch(() => {});
+    };
     const fire = (error = null) => {
       if (elapsed || !active) {
         return;
@@ -11526,29 +11779,36 @@
         onElapsed(error);
       }
     };
-    const localTimer = window.setTimeout(() => {
+    localTimer = window.setTimeout(() => {
       fire(createDeadlineError("local deadline", timeoutMs));
+      cancelRemote();
     }, timeoutMs);
-    if (hasRuntimeMessaging()) {
-      sendRuntimeMessage({
-        type: "lvr:waitForRuntimeDeadline",
-        delayMs: timeoutMs
-      }).then(() => {
-        fire(createDeadlineError("runtime deadline", timeoutMs));
-      }).catch((error) => {
-        fire(error);
-      });
-    }
+    sendRuntimeMessage({
+      type: "lvr:waitForRuntimeDeadline",
+      deadlineId,
+      timeoutMs
+    }).then((response) => {
+      if (!response || response.elapsed !== true || !active || elapsed) {
+        return;
+      }
+      window.clearTimeout(localTimer);
+      fire(createDeadlineError("background deadline", timeoutMs));
+    }).catch(() => {});
     return () => {
       active = false;
       window.clearTimeout(localTimer);
+      cancelRemote();
     };
   }
 
   function emitArchiveProgress(message, archive, candidatesTotal, lines = []) {
     const players = Array.isArray(archive && archive.players) ? archive.players : [];
+    const observedAt = Date.now();
     const payload = {
-      source: "bsportsfan-progress",
+      ...getTableTennisCollectorMessageIdentity(),
+      source: "table-tennis",
+      statusKind: "progress",
+      observedAt,
       message,
       candidates: Number.isFinite(Number(candidatesTotal))
         ? Number(candidatesTotal)
@@ -11567,9 +11827,14 @@
       details: Array.isArray(lines) && lines.length ? lines : null
     };
     const cipMonitor = window.__liveValueRadarBsportsfanCipMonitor;
-    if (cipMonitor && typeof cipMonitor === "object") {
-      payload.cipMonitor = { ...cipMonitor };
-    }
+    payload.bsportsfan = {
+      dataSource: getCurrentTableTennisSourceId(),
+      url: normalizeUrl(location.href),
+      ts: observedAt,
+      cipMonitor: cipMonitor && typeof cipMonitor === "object"
+        ? { ...cipMonitor }
+        : null
+    };
 
     sendRuntimeMessage({
       type: "lvr:setScanStatus",
@@ -11785,12 +12050,12 @@
     ) {
       return false;
     }
-    tableTennisSourceFailoverRetryNeeded = false;
     tableTennisSourceFailoverStarted = true;
     const rateLimited = Number(error && error.status || 0) === 429
       || normalizeText(error && error.code || "") === "bsportsfan-rate-limited";
     sendRuntimeMessage({
       type: "lvr:reportBsportsfanProtection",
+      ...getTableTennisCollectorMessageIdentity(),
       reason: normalizeText(reason || "bsportsfan-protection"),
       code: normalizeText(error && error.code || "bsportsfan-challenge"),
       status: Number(error && error.status || 0) || 0,
@@ -11806,8 +12071,11 @@
     }).then((route) => {
       if (route && route.reported === false) {
         tableTennisSourceFailoverStarted = false;
-        tableTennisSourceFailoverRetryNeeded = true;
-        visibleChallengeActive = false;
+        if (isCurrentTableTennisSourcePageHealthy(document)) {
+          visibleChallengeActive = false;
+          visibleHealthyReported = false;
+          lastVisibleHealthyReportAt = 0;
+        }
         return;
       }
       if (route && route.targetOrigin && route.targetOrigin !== location.origin) {
@@ -11823,12 +12091,18 @@
       }
       if (isCurrentTableTennisSourcePageHealthy(document)) {
         visibleChallengeActive = false;
-        visibleHealthyReported = true;
-        lastVisibleHealthyReportAt = Date.now();
-        sendRuntimeMessage({
+        visibleHealthyReported = false;
+        lastVisibleHealthyReportAt = 0;
+        sendRuntimeMessageWithTimeout({
           type: "lvr:reportBsportsfanHealthy",
+          ...getTableTennisCollectorMessageIdentity(),
           observedAt: Date.now(),
           url: normalizeUrl(location.href)
+        }, TABLE_TENNIS_COLLECTOR_CLAIM_TIMEOUT_MS).then((response) => {
+          if (response && response.accepted === true) {
+            visibleHealthyReported = true;
+            lastVisibleHealthyReportAt = Date.now();
+          }
         }).catch(() => {});
         return;
       }

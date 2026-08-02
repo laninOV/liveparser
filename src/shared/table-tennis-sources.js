@@ -6,6 +6,12 @@
     bsportsfan: "https://ru.bsportsfan.com"
   });
   const SOURCE_IDS = Object.freeze(Object.keys(ORIGINS));
+  const TAB_URL_PATTERNS = Object.freeze([
+    "https://bsportsfan.com/*",
+    "https://*.bsportsfan.com/*",
+    "https://betsapi.com/*",
+    "https://*.betsapi.com/*"
+  ]);
 
   function isBsportsfanHostname(value) {
     const hostname = String(value || "").toLowerCase();
@@ -65,6 +71,7 @@
   root.LvrTableTennisSources = Object.freeze({
     ORIGINS,
     SOURCE_IDS,
+    TAB_URL_PATTERNS,
     buildCandidateSourceIds,
     getAlternateSourceId,
     getOrigin,
