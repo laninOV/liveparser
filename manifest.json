@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Прогноз настольного тенниса",
   "description": "Прогнозирует 2+ сета: история, PBP и прематч-рынок с контролем качества данных.",
-  "version": "0.34.4",
+  "version": "0.34.5",
   "action": {
     "default_title": "Прогноз настольного тенниса",
     "default_popup": "src/popup/popup.html"

@@ -1044,7 +1044,6 @@ function buildCurrentForecastView(archive) {
     leagueName,
     moneylineMarket,
     decisionAt,
-    collectionLatencyMs: Number(archive && archive.collectionLatencyMs),
     z0Score: selection.z0Score
   });
   const finalSideIndex = pair.selectedSideIndex === 0
@@ -1127,10 +1126,15 @@ function buildPopupStartProfile(player) {
     history: {
       matches: history.matches,
       freshForm3Score: history.freshForm3Score,
+      latestOwnSets: history.latestOwnSets,
       windows: history.windows
     },
     point: {
       matches: Number(point.pointMatches || 0),
+      candidateCount: Number(point.candidateCount || 0),
+      attemptedCandidates: Number(point.attemptedCandidates || 0),
+      collectionComplete: point.collectionComplete === true,
+      stoppedReason: String(point.stoppedReason || ""),
       latest: point.latest || null,
       windows: point.windows || {}
     }
@@ -1154,7 +1158,12 @@ function summarizePopupScoreHistory(history) {
   const freshForm3Score = weightTotal
     ? Math.round(freshRows.reduce((sum, row, index) => sum + popupFreshFormScore(row) * weights[index], 0) / weightTotal)
     : null;
-  return { matches: rows.length, windows, freshForm3Score };
+  return {
+    matches: rows.length,
+    windows,
+    freshForm3Score,
+    latestOwnSets: rows.length ? rows[0].ownSets : null
+  };
 }
 
 function summarizePopupScoreWindow(rows) {
@@ -1324,7 +1333,8 @@ function buildArchiveGamesCsv(rows) {
     "qualityInputsReady",
     "collectionLatencyMs",
     "absoluteZ0Score",
-    "slowThreeMatchWindowRejected",
+    "pointCollectionComplete",
+    "incompleteThreeMatchCollectionRejected",
     "lowZ0ConfidenceRejected",
     "qualityAccepted",
     "pairBaseSelectedSideIndex",
@@ -1441,14 +1451,15 @@ function buildArchiveGamesCsv(rows) {
       qualityInputsReady: isCurrentCollapseGate
         ? features.startMatchPairRegimeQualityInputsReady ?? ""
         : "",
-      collectionLatencyMs: isCurrentCollapseGate
-        ? features.startMatchPairRegimeCollectionLatencyMs ?? prematch.collectionLatencyMs ?? ""
-        : prematch.collectionLatencyMs ?? "",
+      collectionLatencyMs: prematch.collectionLatencyMs ?? "",
       absoluteZ0Score: isCurrentCollapseGate
         ? features.startMatchPairRegimeAbsoluteZ0Score ?? ""
         : "",
-      slowThreeMatchWindowRejected: isCurrentCollapseGate
-        ? features.startMatchPairRegimeSlowThreeMatchWindowRejected ?? ""
+      pointCollectionComplete: isCurrentCollapseGate
+        ? features.startMatchPairRegimePointCollectionComplete ?? ""
+        : "",
+      incompleteThreeMatchCollectionRejected: isCurrentCollapseGate
+        ? features.startMatchPairRegimeIncompleteThreeMatchCollectionRejected ?? ""
         : "",
       lowZ0ConfidenceRejected: isCurrentCollapseGate
         ? features.startMatchPairRegimeLowZ0ConfidenceRejected ?? ""

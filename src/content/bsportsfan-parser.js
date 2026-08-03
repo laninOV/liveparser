@@ -47,7 +47,7 @@
   const PREMATCH_VISIBLE_CIP_EVIDENCE = "cip-visible-waiting";
   const START_SCORE_HISTORY_MIN_MATCHES = 5;
   const PREMATCH_POINT_PROFILE_MATCHES = 5;
-  const PREMATCH_POINT_PROFILE_CANDIDATES = 8;
+  const PREMATCH_POINT_PROFILE_CANDIDATES = 10;
   const PREMATCH_POINT_PROFILE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
   const PREMATCH_POINT_PROFILE_PARTIAL_CACHE_TTL_MS = 10 * 60 * 1000;
   const PREMATCH_POINT_MATCH_CACHE_TTL_MS = 48 * 60 * 60 * 1000;
@@ -56,7 +56,7 @@
   const PREMATCH_POINT_FETCH_CONCURRENCY = 1;
   const PREMATCH_POINT_CACHE_STORAGE_KEY = "__lvrPrematchPointCacheV5";
   const SHARED_PREMATCH_POINT_CACHE_STORAGE_KEY = "tableTennisSharedPrematchPointCacheV1";
-  const PREMATCH_POINT_CACHE_STORAGE_VERSION = 3;
+  const PREMATCH_POINT_CACHE_STORAGE_VERSION = 4;
   const MATCH_START_RULE_ID = String(
     globalThis.LvrStartMatchRule && globalThis.LvrStartMatchRule.RULE_ID || ""
   );
@@ -105,8 +105,8 @@
   const PREMATCH_POINT_FETCH_TIMEOUT_MS = 22 * 1000;
   const PREMATCH_POINT_ENRICH_MIN_REMAINING_MS = 6500;
   const MATCH_START_ARCHIVE_MAX_AGE_MS = 5 * 60 * 1000;
-  const INLINE_FORECAST_MAX_ROWS = 6;
-  const INLINE_FORECAST_PREWARM_LOOKAHEAD_MS = 5 * 60 * 1000;
+  const INLINE_FORECAST_MAX_ROWS = 8;
+  const INLINE_FORECAST_PREWARM_LOOKAHEAD_MS = 15 * 60 * 1000;
   const INLINE_FORECAST_FETCH_CONCURRENCY = 2;
   const INLINE_FORECAST_WORKER_CONCURRENCY = 1;
   const NETWORK_CACHE_MAX_ENTRIES = 48;
@@ -3331,15 +3331,22 @@
         const pointMatches = Array.isArray(archive.pointProfileSummary && archive.pointProfileSummary.pointMatches)
           ? archive.pointProfileSummary.pointMatches.map(Number)
           : [];
+        const pointCollectionsComplete = Array.isArray(
+          archive.pointProfileSummary && archive.pointProfileSummary.collectionComplete
+        )
+          ? archive.pointProfileSummary.collectionComplete.map((value) => value === true)
+          : [];
         if (
           archive.pointProfileSummary.status === "error"
           || Number(archive.pointProfileSummary.readyPlayers || 0) < 2
           || pointMatches.length < 2
           || pointMatches.some((matches) => !Number.isFinite(matches) || matches < 3)
+          || pointCollectionsComplete.length < 2
+          || pointCollectionsComplete.some((complete) => !complete)
         ) {
           archive.retryable = true;
           archive.retryReason = archive.pointProfileSummary.error
-            || `temporary PBP coverage ${pointMatches.join("+") || "0+0"}`;
+            || `temporary PBP collection ${pointMatches.join("+") || "0+0"}`;
           archive.retryAfterMs = Math.max(
             0,
             Number(archive.pointProfileSummary.retryAfterMs || 0) || 0
@@ -8261,7 +8268,6 @@
           leagueName: telegramContext.leagueName,
           moneylineMarket: frozenMoneylineMarket,
           decisionAt: finalDecisionAt,
-          collectionLatencyMs: finiteNumberOrNull(context && context.collectionLatencyMs),
           z0Score: finiteNumberOrNull(evaluation.z0Score)
         })
       : {
@@ -8296,10 +8302,10 @@
           marketSalvageAccepted: false,
           marketSnapshot: frozenMoneylineMarket,
           qualityInputsReady: false,
-          collectionLatencyMs: finiteNumberOrNull(context && context.collectionLatencyMs),
           z0Score: finiteNumberOrNull(evaluation.z0Score),
           absoluteZ0Score: null,
-          slowThreeMatchWindowRejected: false,
+          pointCollectionComplete: false,
+          incompleteThreeMatchCollectionRejected: false,
           lowZ0ConfidenceRejected: false,
           qualityAccepted: false,
           sumWithinLimit: false,
@@ -8486,9 +8492,10 @@
       startMatchPairRegimeFormulaAccepted: pairRegime.formulaAccepted ? 1 : 0,
       startMatchPairRegimeModerateAccepted: pairRegime.moderateAccepted ? 1 : 0,
       startMatchPairRegimeQualityInputsReady: pairRegime.qualityInputsReady ? 1 : 0,
-      startMatchPairRegimeCollectionLatencyMs: finiteNumberOrNull(pairRegime.collectionLatencyMs) ?? "",
       startMatchPairRegimeAbsoluteZ0Score: finiteNumberOrNull(pairRegime.absoluteZ0Score) ?? "",
-      startMatchPairRegimeSlowThreeMatchWindowRejected: pairRegime.slowThreeMatchWindowRejected ? 1 : 0,
+      startMatchPairRegimePointCollectionComplete: pairRegime.pointCollectionComplete ? 1 : 0,
+      startMatchPairRegimeIncompleteThreeMatchCollectionRejected:
+        pairRegime.incompleteThreeMatchCollectionRejected ? 1 : 0,
       startMatchPairRegimeLowZ0ConfidenceRejected: pairRegime.lowZ0ConfidenceRejected ? 1 : 0,
       startMatchPairRegimeQualityAccepted: pairRegime.qualityAccepted ? 1 : 0,
       startMatchSignalMode: pairRegime.signalMode || "rejected",
@@ -8645,6 +8652,10 @@
       },
       point: {
         matches: Number(point.pointMatches || 0),
+        candidateCount: Number(point.candidateCount || 0),
+        attemptedCandidates: Number(point.attemptedCandidates || 0),
+        collectionComplete: point.collectionComplete === true,
+        stoppedReason: normalizeText(point.stoppedReason || ""),
         latest: point.latest || null,
         windows: point.windows || {}
       }
@@ -8852,6 +8863,10 @@
           .filter((match) => scoreArchiveCandidate(match.url, `${(match.names || []).join(" ")} ${match.text || ""}`, [playerName]) > 0)
           .sort(sortMatchesByFreshness);
         const matches = availableMatches.slice(0, matchesPerPlayer);
+        const pointCandidates = availableMatches.slice(
+          0,
+          Math.max(matchesPerPlayer, PREMATCH_POINT_PROFILE_CANDIDATES)
+        );
         const scoreHistory = availableMatches
           .slice(0, scoreHistoryMatchesPerPlayer)
           .map((match) => buildPlayerScoreHistoryItem(playerName, match))
@@ -8870,7 +8885,7 @@
           profileCacheAgeMs,
           scoreHistoryMatches: scoreHistory.length,
           scoreHistory,
-          selected: matches.map((match) => ({
+          selected: pointCandidates.map((match) => ({
             url: match.url,
             names: Array.isArray(match.names) ? match.names.slice(0, 2) : [],
             date: match.date || "",
@@ -9051,7 +9066,10 @@
       requestedPlayers: list.length,
       readyPlayers: profiles.filter(Boolean).length,
       cacheHits: profiles.filter((profile) => profile && profile.cacheStatus === "hit").length,
-      pointMatches: profiles.map((profile) => Number(profile && profile.pointMatches || 0))
+      pointMatches: profiles.map((profile) => Number(profile && profile.pointMatches || 0)),
+      collectionComplete: profiles.map((profile) => profile && profile.collectionComplete === true),
+      attemptedCandidates: profiles.map((profile) => Number(profile && profile.attemptedCandidates || 0)),
+      candidateCount: profiles.map((profile) => Number(profile && profile.candidateCount || 0))
     };
   }
 
@@ -9077,6 +9095,7 @@
       && cached.signature === signature
       && now - Number(cached.capturedAt || 0) <= getPrematchPointProfileCacheTtl(cached.profile)
       && cached.profile
+      && cached.profile.collectionComplete === true
     ) {
       setBoundedMapValue(prematchPointProfileCache, cacheKey, cached, PREMATCH_POINT_PROFILE_CACHE_MAX_ENTRIES);
       return {
@@ -9115,8 +9134,10 @@
       if (!profile) {
         return null;
       }
-      const entry = { capturedAt: Date.now(), signature, profile };
-      setBoundedMapValue(prematchPointProfileCache, cacheKey, entry, PREMATCH_POINT_PROFILE_CACHE_MAX_ENTRIES);
+      if (profile.collectionComplete === true) {
+        const entry = { capturedAt: Date.now(), signature, profile };
+        setBoundedMapValue(prematchPointProfileCache, cacheKey, entry, PREMATCH_POINT_PROFILE_CACHE_MAX_ENTRIES);
+      }
       schedulePrematchPointCachePersist();
       return { ...profile, cacheStatus: "miss", cacheAgeMs: 0 };
     }).finally(() => {
@@ -9143,18 +9164,23 @@
   async function buildPrematchPointProfile(player, candidates, signature, options = {}) {
     const matches = [];
     let endpointBlockedError = null;
+    let attemptedCandidates = 0;
+    let stoppedReason = "";
     for (const candidate of candidates) {
       throwIfInlineForecastShouldYield(options, "point-profile");
       const remainingMs = getOperationRemainingMs(options.deadlineAt);
       if (remainingMs <= 250) {
+        stoppedReason = "deadline";
         break;
       }
       if (
         matches.length >= 3
         && remainingMs < PREMATCH_POINT_ENRICH_MIN_REMAINING_MS
       ) {
+        stoppedReason = "deadline";
         break;
       }
+      attemptedCandidates += 1;
       try {
         const compactMatch = await getCompactPrematchPointMatch(candidate.url, options);
         const sideIndex = findCompactPrematchPointMatchSide(compactMatch, player);
@@ -9166,22 +9192,40 @@
           endpointBlockedError = endpointBlockedError || error;
           break;
         }
+        if (String(error && error.code || "") === "lvr-runtime-deadline") {
+          stoppedReason = "deadline";
+          break;
+        }
         // A missing historical chart should not cancel the whole pair.
       }
       // The production rule consumes a common five-match window (or three when
       // five valid charts do not exist). Reading the remaining candidates after
       // five valid charts only delays a first-set decision without changing it.
       if (matches.length >= PREMATCH_POINT_PROFILE_MATCHES) {
+        stoppedReason = "target-reached";
         break;
       }
     }
+    if (endpointBlockedError) {
+      throw endpointBlockedError;
+    }
     if (!matches.length) {
-      if (endpointBlockedError) {
-        throw endpointBlockedError;
-      }
       return null;
     }
-    return summarizePrematchPointProfile(player, matches, signature);
+    const collectionComplete = stoppedReason !== "deadline"
+      && (
+        matches.length >= PREMATCH_POINT_PROFILE_MATCHES
+        || attemptedCandidates >= candidates.length
+      );
+    if (!stoppedReason) {
+      stoppedReason = collectionComplete ? "candidates-exhausted" : "incomplete";
+    }
+    return summarizePrematchPointProfile(player, matches, signature, {
+      candidateCount: candidates.length,
+      attemptedCandidates,
+      collectionComplete,
+      stoppedReason
+    });
   }
 
   async function getCompactPrematchPointMatch(url, options = {}) {
@@ -9390,7 +9434,7 @@
     return byName === 0 || byName === 1 ? byName : null;
   }
 
-  function summarizePrematchPointProfile(player, matches, signature) {
+  function summarizePrematchPointProfile(player, matches, signature, collection = {}) {
     const list = (Array.isArray(matches) ? matches : []).slice(0, PREMATCH_POINT_PROFILE_CANDIDATES);
     const latest = summarizePrematchPointWindow(list.slice(0, 1));
     const windows = Object.fromEntries([8, 5, 3].map((size) => [
@@ -9402,6 +9446,10 @@
       playerKey: getPrematchPointPlayerKey(player),
       signature,
       pointMatches: list.length,
+      candidateCount: Number(collection.candidateCount || 0),
+      attemptedCandidates: Number(collection.attemptedCandidates || 0),
+      collectionComplete: collection.collectionComplete === true,
+      stoppedReason: normalizeText(collection.stoppedReason || ""),
       latest,
       windows
     };

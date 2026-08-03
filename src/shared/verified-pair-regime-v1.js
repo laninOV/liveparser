@@ -7,9 +7,9 @@
     throw new Error("LvrStartMatchRule must be loaded before LvrVerifiedPairRegimeV1");
   }
   const PROTOCOL = Object.freeze({
-    schemaVersion: 13,
-    id: "start-z0-market-consensus-quality-v13-2026-08-03",
-    gateId: "pbp-or-market-consensus-quality-v3",
+    schemaVersion: 14,
+    id: "start-z0-complete-pbp-quality-v14-2026-08-03",
+    gateId: "complete-pbp-or-market-consensus-v4",
     selectorFormulaId: startRule.FORMULA_ID,
     target: "player-takes-two-or-more-sets",
     registeredAt: "2026-08-03T00:00:00Z",
@@ -19,7 +19,7 @@
     rules: Object.freeze({
       pointWindow: "same common selector window: 5, otherwise 3",
       gate: "the frozen moderate PBP gate is the base fallback; a rejected match is restored only when causal opening match-result odds agree with Z0 at normalized favorite probability 0.55 or higher",
-      quality: "reject a three-match PBP fallback collected in 60 seconds or more, and reject an absolute Z0 margin below 10",
+      quality: "a three-match PBP fallback is valid only after every available candidate was checked; reject an absolute Z0 margin below 10",
       side: "use frozen Z0 by default; causal opening match-result favorite replaces it only at normalized favorite probability 0.60 or higher",
       currentScore: "not used for the gate or the final side; live state only confirms that the first set is still in progress"
     })
@@ -36,7 +36,6 @@
     rejectedRelativeAgreementScore: 2.5,
     marketSalvageFavoriteProbabilityMinimum: 0.55,
     marketSideOverrideFavoriteProbabilityMinimum: 0.6,
-    slowThreeMatchWindowCollectionLatencyRejectAtMs: 60 * 1000,
     minimumAbsoluteZ0Score: 10
   });
 
@@ -245,7 +244,6 @@
     const pointWindowSize = Number(input.pointWindowSize);
     const relativeAgreementScore = finiteOrNull(input.relativeAgreementScore);
     const latestPbpReversal = input.latestPbpReversal === true;
-    const collectionLatencyMs = finiteOrNull(input.collectionLatencyMs);
     const z0Score = finiteOrNull(input.z0Score);
     const absoluteZ0Score = z0Score === null ? null : Math.abs(z0Score);
     const leagueClass = classifyLeague(input.leagueName);
@@ -346,15 +344,17 @@
       && relativeAgreementScore === THRESHOLDS.rejectedRelativeAgreementScore
     );
     const moderateAccepted = formulaAccepted && !rejectedByModerateTier;
-    const qualityInputsReady = Boolean(
-      collectionLatencyMs !== null
-      && collectionLatencyMs >= 0
-      && z0Score !== null
+    const qualityInputsReady = z0Score !== null;
+    const pointCollectionComplete = Boolean(
+      pointWindowSize === 5
+      || pointWindowSize === 3
+        && profiles.length === 2
+        && profiles.every((profile) => profile && profile.point && profile.point.collectionComplete === true)
     );
-    const slowThreeMatchWindowRejected = Boolean(
+    const incompleteThreeMatchCollectionRejected = Boolean(
       qualityInputsReady
       && pointWindowSize === 3
-      && collectionLatencyMs >= THRESHOLDS.slowThreeMatchWindowCollectionLatencyRejectAtMs
+      && !pointCollectionComplete
     );
     const lowZ0ConfidenceRejected = Boolean(
       qualityInputsReady
@@ -362,7 +362,7 @@
     );
     const qualityAccepted = Boolean(
       qualityInputsReady
-      && !slowThreeMatchWindowRejected
+      && !incompleteThreeMatchCollectionRejected
       && !lowZ0ConfidenceRejected
     );
     const baseSignalMode = moderateAccepted
@@ -385,10 +385,10 @@
           relativeAgreementScore,
           latestPbpReversal,
           pointWindowSize,
-          collectionLatencyMs,
           z0Score,
           absoluteZ0Score,
-          slowThreeMatchWindowRejected,
+          pointCollectionComplete,
+          incompleteThreeMatchCollectionRejected,
           lowZ0ConfidenceRejected,
           qualityAccepted,
           leagueClass,
@@ -408,7 +408,7 @@
     else if (!metricsReady) reason = "collapse-metrics-missing";
     else if (!qualityInputsReady) reason = "production-quality-inputs-missing";
     else if (leagueClass === "blocked") reason = "collapse-league-blocked";
-    else if (slowThreeMatchWindowRejected) reason = "production-slow-three-match-window-rejected";
+    else if (incompleteThreeMatchCollectionRejected) reason = "production-incomplete-three-match-pbp-rejected";
     else if (lowZ0ConfidenceRejected) reason = "production-low-z0-confidence-rejected";
     else if (shadowOnly) reason = "tt-cup-shadow-only";
     else if (accepted && !moderateAccepted && marketSalvageAccepted) reason = "production-market-consensus-salvage-qualified";
@@ -437,10 +437,10 @@
       moderateAccepted,
       rejectedByModerateTier,
       qualityInputsReady,
-      collectionLatencyMs: round(collectionLatencyMs, 3),
       z0Score: round(z0Score),
       absoluteZ0Score: round(absoluteZ0Score),
-      slowThreeMatchWindowRejected,
+      pointCollectionComplete,
+      incompleteThreeMatchCollectionRejected,
       lowZ0ConfidenceRejected,
       qualityAccepted,
       signalMode,
